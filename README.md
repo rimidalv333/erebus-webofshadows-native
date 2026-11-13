@@ -4,10 +4,10 @@ This is a native PS5 build of *Spider-Man: Web of Shadows* (Xbox 360), made from
 No game files are included, you need your own disc image (see below).
 
 **State of the release**
-The game targets 60 and holds it almost everywhere. There are areas where the lowest drops can be 51 fps, mostly when looking across the skyline from the densest part of the city. That limit is the game's own drawing code on the CPU, not the GPU (the GPU sits at about 2-3 ms a frame).
+NOT PERFECT. The game targets 60 and holds it almost everywhere. There are areas where the lowest drops can be 51-55 fps, mostly when looking across the skyline from the densest part of the city. That limit is the game's own drawing code on the CPU, not the GPU (the GPU sits at about 2-3 ms a frame).
 I have not finished a full playthrough on this build yet (port was mainly tested on an initial version of the game utilizing only GPU emulation).
 Still, the native renderer has been tested against a confident >50% of the game with no obvious visual glitches or degradation.
-Shaders the renderer has never seen get recorded on the console and added to the bundled shader cache, so the cache (and this repo) will be updated with time.
+Shaders the renderer has never seen get recorded on the console and added to the bundled shader cache, so the cache (and this repo) will be updated with time as I continue testing.
 
 **Which disc image**
 Only the USA release works (Redump name *Spider-Man - Web of Shadows (USA) (En,Fr)*), unpatched, no title update:
