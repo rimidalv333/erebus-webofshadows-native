@@ -130,5 +130,5 @@ Native renderer in its infancy:
 <img width="1568" height="735" alt="image" src="https://github.com/user-attachments/assets/b58404c3-192b-4898-adfd-d40e0179daf3" />
 <img width="2148" height="806" alt="image" src="https://github.com/user-attachments/assets/58476424-a23f-461b-90c0-ec223ffb47e5" />
 
-Screenshot from mature build:
-<img width="2249" height="1266" alt="image" src="https://github.com/user-attachments/assets/f8b7fb7b-ef97-41c5-b3df-b03315fb7455" />
+Screenshot from mature build taken straight from console (1080p TV):
+<img width="3840" height="2160" alt="20261113_181040_00827035" src="https://github.com/user-attachments/assets/0c083082-b4ad-4b46-af5b-642944eaa320" />
