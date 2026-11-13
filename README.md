@@ -4,12 +4,14 @@ This is a native PS5 build of *Spider-Man: Web of Shadows* (Xbox 360), made from
 No game files are included, you need your own disc image (see below).
 
 **State of the release**
+
 NOT PERFECT. The game targets 60 and holds it almost everywhere. There are areas where the lowest drops can be 51-55 fps, mostly when looking across the skyline from the densest part of the city. That limit is the game's own drawing code on the CPU, not the GPU (the GPU sits at about 2-3 ms a frame).
 I have not finished a full playthrough on this build yet (port was mainly tested on an initial version of the game utilizing only GPU emulation).
 Still, the native renderer has been tested against a confident >50% of the game with no obvious visual glitches or degradation.
 Shaders the renderer has never seen get recorded on the console and added to the bundled shader cache, so the cache (and this repo) will be updated with time as I continue testing.
 
 **Which disc image**
+
 Only the USA release works (Redump name *Spider-Man - Web of Shadows (USA) (En,Fr)*), unpatched, no title update:
 ```
 Title ID      41560815
@@ -27,6 +29,7 @@ SHA-1   1debbfa1e5188660db0bd4aa6b7ba1c886a72150
 A dump with different image checksums (another dump, a trimmed image) still works as long as its `default.xex` matches.
 
 **Building**
+
 Setup: a PC with Linux (Ubuntu 24.04) or Windows with WSL2 (Ubuntu 24.04), x86-64, about 25 GB free and 16 GB of memory or more. The first build takes one to a few hours (it builds the console toolchain and the graphics driver), later builds are a lot faster.
 On Windows, open the Ubuntu terminal and keep the folder in your Linux home (e.g. `~/WoS-PS5`), not on `C:`, otherwise the build is many times slower.
 
@@ -57,11 +60,13 @@ WOS_CODEGEN_OPTS="" ./build.sh "/path/to/your.iso"
 ```
 
 **Installing**
+
 Copy the whole `PPSA31622` folder to `/data/homebrew/` on the PS5, then launch from the home screen (ShadowMountPlus).
 Title art, icon art and snd0.at9 musical track on hover included.
 Tested with kstuff 1.13-fpkg-dr-test5, ShadowMount 1.7beta7
 
 **Settings**
+
 Everything is in `PPSA31622/wos_recomp.toml`. The defaults are the values I tested with:
 ```toml
 draw_resolution_scale_x = 2      # 1 = 720p, 2 = 1440p, 3 = 4K
@@ -76,6 +81,7 @@ wos_adaptive_sync = false
 `wos_strip_merge` and `wos_strip_fast_path` are what bring the heavy city views from about 3,800 draws a frame down to about 2,400. If you ever see missing or broken building windows, set both to 0 and tell me. This was and still is the main CPU bottleneck.
 
 **Texture modding**
+
 The title comes bundled with a texture mod that only affects button prompts - changing them to PS ones from X360.
 Textures can be replaced like so: put `<fingerprint>.bin` in `PPSA31622/mods/textures/` and the renderer loads it instead of the original
 (same size required, the game files stay untouched).
@@ -90,6 +96,7 @@ only renderer was the emulated X360 GPU, some of the toml switches might not fun
 In theory however, this could allow texture modding for suits, flags or other miscellaneous textures one might want to change.
 
 **Credits**
+
 This builds on the work of:
 - **WebOfShadowsRecomp** (toowasmir) - the game's recompilation project, the sources codegen needs are bundled in `deps-archive/`
 - **ReXGlue** and **Xenia** - the recompiler, runtime and Xbox 360 GPU emulation, KongaTime's fork with the PS5 target
@@ -100,6 +107,7 @@ This builds on the work of:
 - **LLVM/Clang**, **Mesa** and their contributors
 
 **Bundled dependencies**
+
 Everything the build needs is pinned to the exact revision I built and tested with and ships in `deps-archive/` with its own license files:
 ```
 rexglue-sdk (third-party sources incl. inja)  f47ccdd          BSD (Xenia portions included)
@@ -116,14 +124,17 @@ zlib                                          1.3.2            zlib
 Each component keeps its own license, the built title carries them in `PPSA31622/licenses/` and `PPSA31622/LEGAL.txt`. This repository is GPL-3.0-or-later as it links GPL-3.0 components.
 
 **Legal**
+
 Not affiliated with or endorsed by Activision, Marvel, Sony or Microsoft. All assets belong to their owners. Only use a disc image of a game you own.
 
 **Known issues / limitations**
+
 Some moves and combos are harder to time at 60 fps (the game was built around 30), but they all still work.
 Buildings, shadows, enemies and other characters pop in at a distance, the same as on the original Xbox 360 release. The game decides its own draw distances and this build keeps them.
 The heaviest skyline views can still drop to about 51 fps.
 
 NOTICE - **AI assistance**
+
 Generative AI was used for part of the code in this project, to speed up development. Getting from the first emulated-GPU boot to the near-60 fps native build took close to a thousand test iterations: builds, console runs, shader dumps and kernel logs. The AI helped write and adjust code and read through that volume of output. Every change was built and tested on real base PS5 hardware before it went in, and the testing, decisions and direction were mine.
 
 Native renderer in its infancy:
