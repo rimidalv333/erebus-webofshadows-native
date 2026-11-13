@@ -117,3 +117,18 @@ Each component keeps its own license, the built title carries them in `PPSA31622
 
 **Legal**
 Not affiliated with or endorsed by Activision, Marvel, Sony or Microsoft. All assets belong to their owners. Only use a disc image of a game you own.
+
+**Known issues / limitations**
+Some moves and combos are harder to time at 60 fps (the game was built around 30), but they all still work.
+Buildings, shadows, enemies and other characters pop in at a distance, the same as on the original Xbox 360 release. The game decides its own draw distances and this build keeps them.
+The heaviest skyline views can still drop to about 51 fps.
+
+NOTICE - **AI assistance**
+Generative AI was used for part of the code in this project, to speed up development. Getting from the first emulated-GPU boot to the near-60 fps native build took close to a thousand test iterations: builds, console runs, shader dumps and kernel logs. The AI helped write and adjust code and read through that volume of output. Every change was built and tested on real base PS5 hardware before it went in, and the testing, decisions and direction were mine.
+
+Native renderer in its infancy:
+<img width="1568" height="735" alt="image" src="https://github.com/user-attachments/assets/b58404c3-192b-4898-adfd-d40e0179daf3" />
+<img width="2148" height="806" alt="image" src="https://github.com/user-attachments/assets/58476424-a23f-461b-90c0-ec223ffb47e5" />
+
+Screenshot from mature build:
+<img width="2249" height="1266" alt="image" src="https://github.com/user-attachments/assets/f8b7fb7b-ef97-41c5-b3df-b03315fb7455" />
