@@ -1,0 +1,31 @@
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -1903,7 +1903,7 @@
+         if (isPixelShader)
+         {
+             value = reinterpret_cast<const PixelShader*>(shader)->interpolators[i];
+-            println("\tfloat4 r{} = i{}{};", uint32_t(interpolator.reg), USAGE_VARIABLES[uint32_t(interpolator.usage)], uint32_t(interpolator.usageIndex));
++            println("\t{}float4 r{} = i{}{};", getenv("WOS_PRECISE") ? "precise " : "", uint32_t(interpolator.reg), USAGE_VARIABLES[uint32_t(interpolator.usage)], uint32_t(interpolator.usageIndex));
+             printedRegisters[interpolator.reg] = true;
+         }
+         else
+@@ -1955,7 +1955,7 @@
+             if (!isPixelShader)
+                 registerDeclOffsets[i] = out.size() + 1;
+         #endif
+-            print("\tfloat4 r{} = ", i);
++            print("\t{}float4 r{} = ", getenv("WOS_PRECISE") ? "precise " : "", i); // WoS (fix63): WOS_PRECISE
+             if (isPixelShader && i == ((shader->fieldC >> 8) & 0xFF))
+             {
+                 out += "float4((iPos.xy - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
+@@ -1980,8 +1980,8 @@
+     if (!isPixelShader)
+         psDeclOffset = out.size() + 1;
+ #endif
+-    out += "\tfloat ps = 0.0;\n";
+-    out += "\tfloat4 vpre = 0.0;\n";
++    out += getenv("WOS_PRECISE") ? "\tprecise float ps = 0.0;\n" : "\tfloat ps = 0.0;\n"; // WoS (fix63)
++    out += getenv("WOS_PRECISE") ? "\tprecise float4 vpre = 0.0;\n" : "\tfloat4 vpre = 0.0;\n";
+     if (isPixelShader)
+     {
+ #ifdef UNLEASHED_RECOMP

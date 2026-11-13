@@ -1,0 +1,104 @@
+diff -ru a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+--- a/XenosRecomp/shader_common.h	2026-11-07 22:32:33.815327591 +0000
++++ b/XenosRecomp/shader_common.h	2026-11-07 22:32:33.817796308 +0000
+@@ -434,6 +434,16 @@
+     e = err;
+ }
+ 
++// WoS port (fix100): Xenos (Direct3D 9) multiply - a product with a 0 operand is 0, even
++// times inf or NaN (IEEE: NaN). Used by the pixel shaders' mul/mad/dp/muls.
++float mulL(float a, float b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }
++float2 mulL(float2 a, float2 b) { return select(a == 0.0, 0.0, select(b == 0.0, 0.0, a * b)); }
++float3 mulL(float3 a, float3 b) { return select(a == 0.0, 0.0, select(b == 0.0, 0.0, a * b)); }
++float4 mulL(float4 a, float4 b) { return select(a == 0.0, 0.0, select(b == 0.0, 0.0, a * b)); }
++float dotL(float4 a, float4 b) { return dot(mulL(a, b), 1.0.xxxx); }
++float dotL(float3 a, float3 b) { return dot(mulL(a, b), 1.0.xxx); }
++float dotL(float2 a, float2 b) { return dot(mulL(a, b), 1.0.xx); }
++
+ float dotF(float4 a, float4 b) { return dot(a, b); }
+ float dotF(float3 a, float3 b) { return dot(a, b); }
+ 
+diff -ru a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+--- a/XenosRecomp/shader_recompiler.cpp	2026-11-07 22:32:33.816610358 +0000
++++ b/XenosRecomp/shader_recompiler.cpp	2026-11-07 22:32:33.817819880 +0000
+@@ -892,7 +892,14 @@
+             break;
+ 
+         case AluVectorOpcode::Mul:
+-            print("{} * {}", op(VECTOR_0), op(VECTOR_1));
++            // WoS port (fix100): Xenos multiplies the Direct3D 9 way - 0 * anything (inf, NaN)
++            // is 0. IEEE gave NaN: the poster lighting's specular 0 * log2(0) blacked out the
++            // half where the reflection faced away from the moon. Pixel shaders only (vertex
++            // positions stay bit-identical to the depth pre-pass shaders already cached).
++            if (isPixelShader)
++                print("mulL({}, {})", op(VECTOR_0), op(VECTOR_1));
++            else
++                print("{} * {}", op(VECTOR_0), op(VECTOR_1));
+             break;
+ 
+         case AluVectorOpcode::Max:
+@@ -933,7 +940,10 @@
+             break;
+ 
+         case AluVectorOpcode::Mad:
+-            print("{} * {} + {}", op(VECTOR_0), op(VECTOR_1), op(VECTOR_2));
++            if (isPixelShader)
++                print("mulL({}, {}) + {}", op(VECTOR_0), op(VECTOR_1), op(VECTOR_2));
++            else
++                print("{} * {} + {}", op(VECTOR_0), op(VECTOR_1), op(VECTOR_2));
+             break;
+ 
+         case AluVectorOpcode::CndEq:
+@@ -966,11 +976,17 @@
+                 break;
+             }
+         #endif
+-            print("dot({}, {})", op(VECTOR_0), op(VECTOR_1));
++            if (isPixelShader)
++                print("dotL({}, {})", op(VECTOR_0), op(VECTOR_1));
++            else
++                print("dot({}, {})", op(VECTOR_0), op(VECTOR_1));
+             break;
+ 
+         case AluVectorOpcode::Dp2Add:
+-            print("dot({}, {}) + {}", op(VECTOR_0), op(VECTOR_1), op(VECTOR_2));
++            if (isPixelShader)
++                print("dotL({}, {}) + {}", op(VECTOR_0), op(VECTOR_1), op(VECTOR_2));
++            else
++                print("dot({}, {}) + {}", op(VECTOR_0), op(VECTOR_1), op(VECTOR_2));
+             break;
+ 
+         case AluVectorOpcode::Cube:
+@@ -1092,12 +1108,18 @@
+             break;
+ 
+         case AluScalarOpcode::Muls:
+-            print("{} * {}", op(SCALAR_0), op(SCALAR_1));
++            if (isPixelShader)
++                print("mulL({}, {})", op(SCALAR_0), op(SCALAR_1));
++            else
++                print("{} * {}", op(SCALAR_0), op(SCALAR_1));
+             break;
+ 
+         case AluScalarOpcode::MulsPrev:
+         case AluScalarOpcode::MulsPrev2:
+-            print("{} * ps", op(SCALAR_0));
++            if (isPixelShader)
++                print("mulL({}, ps)", op(SCALAR_0));
++            else
++                print("{} * ps", op(SCALAR_0));
+             break;
+ 
+         case AluScalarOpcode::Maxs:
+@@ -1221,7 +1243,10 @@
+ 
+         case AluScalarOpcode::Mulsc0:
+         case AluScalarOpcode::Mulsc1:
+-            print("{} * {}", op(SCALAR_CONSTANT_0), op(SCALAR_CONSTANT_1));
++            if (isPixelShader)
++                print("mulL({}, {})", op(SCALAR_CONSTANT_0), op(SCALAR_CONSTANT_1));
++            else
++                print("{} * {}", op(SCALAR_CONSTANT_0), op(SCALAR_CONSTANT_1));
+             break;
+ 
+         case AluScalarOpcode::Addsc0:

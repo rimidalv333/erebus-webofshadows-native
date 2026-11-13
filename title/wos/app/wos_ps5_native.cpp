@@ -1,0 +1,699 @@
+// WebOfShadowsRecomp for the PS5 - native renderer, prototype phase.
+//
+// The emulation path turns the game's D3D draw calls into Xbox 360 PM4 command
+// packets, queues them in a ring buffer, and a single thread reads them back and
+// re-issues them as Vulkan. That single-threaded ring parse is the frame-rate
+// bottleneck (the "GPU Commands" thread).
+//
+// The native path intercepts the game's D3D draw/state calls DIRECTLY - before
+// they become PM4 packets - and (eventually) issues the draw straight to the
+// RADV device the emulated GPU already owns, reusing the SDK's own Xenos->SPIR-V
+// shader translator. This skips the ring entirely.
+//
+// How the interception works: the recompiler defines every guest function as a
+// WEAK, extern "C" symbol (wos_recomp_pch.h: DEFINE_REX_FUNC -> __attribute__
+// ((weak))). A strong definition of the same symbol here overrides it at link
+// time, for EVERY call site - direct or indirect - unlike a function-table hook,
+// which only catches indirect calls (see wos/shim/hooks/perf_monitor.h). Each
+// hook reads what it needs, logs it, then tail-calls the original __imp__ symbol
+// so the emulation path still runs. So with the native path merely OBSERVING, the
+// game renders exactly as before; we build up the real native draw incrementally.
+//
+// PROTOTYPE PHASE: hooks observe and log. No draw is diverted yet. This proves we
+// can intercept the game's draws and read their state - the foundation.
+//
+// Off unless wos_native is set in wos_recomp.toml (the PPSA99311 "Native" title
+// sets it; the PPSA99310 emulation title leaves it off and pays nothing).
+//
+// SPDX-License-Identifier: MIT
+
+#include <atomic>
+#include <cstdint>
+
+#include <rex/cvar.h>
+#include <rex/hash.h>  // XXH3_64bits (inline), to match rexglue's ucode_data_hash
+#include <rex/logging.h>
+#include <rex/ppc.h>
+#include <rex/runtime.h>
+#include <rex/system/kernel_state.h>
+#include <rex/system/xmemory.h>
+// Reach the LIVE emulated GPU to read the shader rexglue has ALREADY resolved and
+// translated for the current draw. rexglue hashes the raw PM4 ucode (IM_LOAD), not
+// the D3D 0x102A1100 container, so the container hash never matches its pipeline
+// lines; the command processor's active_vertex/pixel_shader() give the real thing,
+// keyed by the same ucode_data_hash() that appears in "Creating graphics pipeline
+// state with VS <hash>". The title links librexgpu-xenos.a, so these are available.
+#include <rex/graphics/graphics_system.h>
+#include <rex/graphics/command_processor.h>
+#include <rex/graphics/pipeline/shader/shader.h>
+#include <rex/graphics/register_file.h>  // GetVertexFetch: live VB base/size per draw
+#include <rex/graphics/xenos.h>          // xe_gpu_vertex_fetch_t, VertexFormat
+
+#include "wos_ps5_native_draw.h"         // A1: self-contained offscreen native draw
+
+// WebOfShadowsRecomp: the native renderer master switch. Off by default; the
+// native title turns it on. When off, the hooks below still link (they override
+// the weak guest symbols) but do nothing except call the original - so a build
+// with this file in it behaves identically until wos_native is set.
+REXCVAR_DEFINE_BOOL(wos_native, false, "WoS",
+                    "Native renderer: intercept the game's D3D draws (experimental)");
+// A1 plumbing proof: when set (and wos_native is on), the FIRST time we see the
+// simple target VS with a readable vertex buffer, run one self-contained offscreen
+// host draw and log the rendered pixel count. Off by default; touches no rexglue
+// state. Separate switch so the observe-only path can run without ever drawing.
+REXCVAR_DEFINE_BOOL(wos_native_a1, false, "WoS",
+                    "Native renderer A1: run one isolated offscreen draw as a plumbing proof");
+// NOTE: the A2 proof (draw one guest triangle with rexglue's real SPIR-V) is NOT a
+// title-side cvar. It runs inside rexglue on the GPU command-processor thread (patch
+// 0030) and rexglue reads its own `wos_native_a2` cvar from the same toml. Defining
+// it here too would clash at link time, so the title does not define or read it.
+
+extern "C" void prospero_startup_log(const char *message);
+
+namespace wos {
+namespace native {
+
+namespace {
+
+std::atomic<bool> g_enabled{false};
+std::atomic<bool> g_a1_enabled{false};
+std::atomic<bool> g_a1_done{false};  // A1 runs exactly once
+std::atomic<uint64_t> g_draw_calls{0};
+std::atomic<uint64_t> g_indexed_draw_calls{0};
+
+// The simplest target geometry we proved the layout for (VS 1E6883FC): 1 binding,
+// stride 7 words = 28 bytes, pos(vec3)+extra(vec4) -- matches our A1 shaders.
+constexpr uint64_t kA1TargetVsHash = 0x1E6883FCCDE1F688ull;
+constexpr uint32_t kA1TargetStrideBytes = 28;
+// Log only occasionally so we don't flood klog: the first few, then every 2048th.
+bool ShouldLog(uint64_t n) { return n < 8 || (n & 2047) == 0; }
+
+// IMPORTANT: this runtime faults on an unmapped guest page (it does NOT read as
+// zero). A shader/device pointer we follow may be stale or bogus, so EVERY guest
+// read must first check the page is committed and readable via the heap API - the
+// same guard wos_ps5_hooks.cpp::Readable and the shader-dump hook use. Without
+// this, dereferencing e.g. a value that happens to equal 0x102A1100 faults.
+inline bool GReadable(uint32_t addr, uint32_t size) {
+  if (addr < 0x00010000u || addr >= 0xE0000000u || (uint64_t(addr) + size) > 0xE0000000u)
+    return false;
+  auto *ks = rex::system::kernel_state();
+  if (!ks || !ks->memory())
+    return true;  // before the runtime is known, fall back to the range check
+  auto *memory = ks->memory();
+  for (uint32_t probe : {addr, addr + size - 1}) {
+    auto *heap = memory->LookupHeap(probe);
+    rex::memory::HeapAllocationInfo info{};
+    if (!heap || !heap->QueryRegionInfo(probe, &info) ||
+        (info.state & rex::memory::kMemoryAllocationCommit) == 0 ||
+        (info.protect & rex::memory::kMemoryProtectRead) == 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Like GReadable but checks ONLY that the range is committed (mapped), not that
+// the CPU-read protection bit is set. Vertex buffers the GPU fetches from are
+// often mapped with GPU-oriented protections where kMemoryProtectRead is not set
+// even though the pages are committed and the CPU can read them (rexglue reads
+// them every draw). For bulk-copying such a buffer we need "mapped", not the
+// strict read bit - committed pages will not fault. Still rejects unmapped pages.
+inline bool GCommitted(uint32_t addr, uint32_t size) {
+  if (addr < 0x00010000u || addr >= 0xE0000000u || (uint64_t(addr) + size) > 0xE0000000u)
+    return false;
+  auto *ks = rex::system::kernel_state();
+  if (!ks || !ks->memory())
+    return false;  // for a bulk copy, require a known runtime; don't guess
+  auto *memory = ks->memory();
+  for (uint32_t probe : {addr, addr + size - 1}) {
+    auto *heap = memory->LookupHeap(probe);
+    rex::memory::HeapAllocationInfo info{};
+    if (!heap || !heap->QueryRegionInfo(probe, &info) ||
+        (info.state & rex::memory::kMemoryAllocationCommit) == 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Read a big-endian guest u32, but only if the page is mapped+readable; returns
+// false (leaving out untouched) otherwise, so callers never fault on a bad ptr.
+inline bool GTryU32(uint8_t *base, uint32_t addr, uint32_t *out) {
+  if (!GReadable(addr, 4))
+    return false;
+  *out = __builtin_bswap32(*reinterpret_cast<volatile uint32_t *>(base + addr));
+  return true;
+}
+
+// Unchecked read - only use on an address already confirmed readable.
+inline uint32_t GLoadU32(uint8_t *base, uint32_t addr) {
+  return __builtin_bswap32(*reinterpret_cast<volatile uint32_t *>(base + addr));
+}
+
+// Session-1 device struct offsets (WoS XDK 6995). Fetch constants and stream/
+// index/RT slots are CONFIRMED; the shader-pointer offsets were NOT pinned down
+// statically (predicted ~12692/12696). We read them live here to locate them.
+constexpr uint32_t kFetchConstants = 1152;   // 0x480, 6 dwords per slot, stride 24
+constexpr uint32_t kIndexBuffer    = 12436;
+constexpr uint32_t kStreamObject0  = 12460;  // + stream*4
+constexpr uint32_t kStreamStride0  = 12528;  // + stream (byte)
+constexpr uint32_t kVertexShader = 12696;  // CONFIRMED on HW (session 3)
+constexpr uint32_t kPixelShader  = 12692;  // CONFIRMED on HW (session 3)
+
+// D3D shader-object internal offsets (EoT d3d.h, XDK 2011 - may shift for WoS 6995).
+// VS object: container pointer at obj+0x368. PS object: physical ptr at obj+0x18,
+// container pointer at obj+0x28. The container is the 0x102A1100 ShaderContainerHeader.
+constexpr uint32_t kVsContainerPtr = 0x368;
+constexpr uint32_t kPsPhysicalPtr  = 0x18;
+constexpr uint32_t kPsContainerPtr = 0x28;
+
+// Does guest address `addr` point at a 0x102A1100 shader container? (safe read)
+bool IsContainer(uint8_t *base, uint32_t addr) {
+  uint32_t flags;
+  return GTryU32(base, addr, &flags) && (flags & 0xFFFFFF00u) == 0x102A1100u;
+}
+
+// Follow a shader-object pointer to its 0x102A1100 container and report it. EVERY
+// read is guarded (GTryU32), so a stale/bogus pointer can never fault. We (a) check
+// if the object IS a container, (b) scan the first 0x400 bytes of the object for a
+// field that POINTS to a container - locating the real offset empirically (EoT's
+// 0x368/0x18/0x28 are for XDK 2011 and may shift for WoS 6995).
+void ResolveShaderObject(uint8_t *base, uint32_t shader_obj, bool is_pixel) {
+  const char *tag = is_pixel ? "PS" : "VS";
+  if (!GReadable(shader_obj, 4)) {
+    REXLOG_INFO("[WoS-NATIVE-SHADER] {} obj={:08X} (unreadable)", tag, shader_obj);
+    return;
+  }
+  // (a) object itself is the container?
+  if (IsContainer(base, shader_obj)) {
+    uint32_t vsz = 0, psz = 0;
+    GTryU32(base, shader_obj + 4, &vsz);
+    GTryU32(base, shader_obj + 8, &psz);
+    REXLOG_INFO("[WoS-NATIVE-SHADER] {} obj={:08X} IS the container; virtSize={} physSize={} (MAGIC OK)",
+                tag, shader_obj, vsz, psz);
+    return;
+  }
+  // (b) scan the object's fields (to 0x800). At each offset check THREE cases:
+  //   inline:   the container magic sits AT obj+off (PS: container embedded at +0x28)
+  //   direct:   obj+off is a POINTER to a container
+  //   2-hop:    obj+off -> record; record[0..0x40] -> container (EoT's VS path)
+  for (uint32_t off = 0; off < 0x800; off += 4) {
+    // inline container at obj+off
+    if (IsContainer(base, shader_obj + off)) {
+      uint32_t vsz = 0, psz = 0, shoff = 0;
+      GTryU32(base, shader_obj + off + 4, &vsz);
+      GTryU32(base, shader_obj + off + 8, &psz);
+      GTryU32(base, shader_obj + off + 0x18, &shoff);
+      // rexglue hashes the ucode as XXH3_64bits(ptr, dword_count*4) over the raw
+      // (big-endian) guest bytes. The ucode block is virtualSize+physicalSize
+      // bytes starting at the container. Compute it and log, so we can match the
+      // pipeline_cache "Creating graphics pipeline state with VS <hash>" lines.
+      const uint32_t total = vsz + psz;
+      const uint32_t cont = shader_obj + off;
+      uint64_t hash = 0;
+      if (total && (total & 3u) == 0 && GReadable(cont, total)) {
+        hash = XXH3_64bits(base + cont, total);
+      }
+      REXLOG_INFO("[WoS-NATIVE-SHADER] {} obj={:08X} container INLINE at +{:#x}: "
+                  "virtSize={} physSize={} shaderOff={:#x} hash={:016X} (MAGIC OK, inline)",
+                  tag, shader_obj, off, vsz, psz, shoff, hash);
+      return;
+    }
+    uint32_t field;
+    if (!GTryU32(base, shader_obj + off, &field))
+      continue;
+    if (IsContainer(base, field)) {
+      uint32_t vsz = 0, psz = 0;
+      GTryU32(base, field + 4, &vsz);
+      GTryU32(base, field + 8, &psz);
+      REXLOG_INFO("[WoS-NATIVE-SHADER] {} obj={:08X} +{:#x} -> container={:08X} "
+                  "virtSize={} physSize={} (MAGIC OK, direct)",
+                  tag, shader_obj, off, field, vsz, psz);
+      return;
+    }
+    if (GReadable(field, 4)) {
+      for (uint32_t roff = 0; roff <= 0x40; roff += 4) {
+        uint32_t inner;
+        if (GTryU32(base, field + roff, &inner) && IsContainer(base, inner)) {
+          uint32_t vsz = 0, psz = 0;
+          GTryU32(base, inner + 4, &vsz);
+          GTryU32(base, inner + 8, &psz);
+          REXLOG_INFO("[WoS-NATIVE-SHADER] {} obj={:08X} +{:#x} -> rec={:08X} +{:#x} -> "
+                      "container={:08X} virtSize={} physSize={} (MAGIC OK, 2-hop)",
+                      tag, shader_obj, off, field, roff, inner, vsz, psz);
+          return;
+        }
+      }
+    }
+  }
+  // Dump the first 32 words of the object so its structure is visible.
+  for (uint32_t off = 0; off < 128; off += 16) {
+    uint32_t w0 = 0, w1 = 0, w2 = 0, w3 = 0;
+    GTryU32(base, shader_obj + off + 0, &w0);
+    GTryU32(base, shader_obj + off + 4, &w1);
+    GTryU32(base, shader_obj + off + 8, &w2);
+    GTryU32(base, shader_obj + off + 12, &w3);
+    REXLOG_INFO("[WoS-NATIVE-DUMP] {} obj+{:#x}: {:08X} {:08X} {:08X} {:08X}",
+                tag, off, w0, w1, w2, w3);
+  }
+  REXLOG_INFO("[WoS-NATIVE-SHADER] {} obj={:08X} no container found (see DUMP above)",
+              tag, shader_obj);
+}
+
+// Short name for a Xenos vertex format (for human-readable layout logging).
+const char *VertexFormatName(rex::graphics::xenos::VertexFormat f) {
+  using VF = rex::graphics::xenos::VertexFormat;
+  switch (f) {
+    case VF::k_8_8_8_8:            return "8_8_8_8";
+    case VF::k_2_10_10_10:         return "2_10_10_10";
+    case VF::k_10_11_11:           return "10_11_11";
+    case VF::k_11_11_10:           return "11_11_10";
+    case VF::k_16_16:              return "16_16";
+    case VF::k_16_16_16_16:        return "16_16_16_16";
+    case VF::k_16_16_FLOAT:        return "16_16_FLOAT";
+    case VF::k_16_16_16_16_FLOAT:  return "16_16_16_16_FLOAT";
+    case VF::k_32:                 return "32";
+    case VF::k_32_32:              return "32_32";
+    case VF::k_32_32_32_32:        return "32_32_32_32";
+    case VF::k_32_FLOAT:           return "32_FLOAT";
+    case VF::k_32_32_FLOAT:        return "32_32_FLOAT";
+    case VF::k_32_32_32_32_FLOAT:  return "32_32_32_32_FLOAT";
+    case VF::k_32_32_32_FLOAT:     return "32_32_32_FLOAT";
+    default:                       return "undefined";
+  }
+}
+
+// Decode and log the vertex layout of the active VS, using rexglue's OWN ucode
+// analysis (shader->vertex_bindings()) plus the live vertex-fetch constants from
+// the GPU register file (the authoritative VB base/size rexglue draws from). This
+// is observe-only: it tells us exactly what a native pipeline would need to bind,
+// so we can validate the layout before building anything. `vs` must be analyzed.
+void ProbeVertexLayout(uint8_t *base, rex::graphics::GraphicsSystem *gs,
+                       rex::graphics::Shader *vs) {
+  if (!vs)
+    return;
+  if (!vs->is_ucode_analyzed()) {
+    // An active, already-translated shader is normally analyzed; note if not.
+    REXLOG_INFO("[WoS-NATIVE-VTX] VS {:016X} not ucode-analyzed yet; skipping layout",
+                vs->ucode_data_hash());
+    return;
+  }
+  auto *rf = gs->register_file();
+  const auto &bindings = vs->vertex_bindings();
+  REXLOG_INFO("[WoS-NATIVE-VTX] VS {:016X}: {} vertex binding(s)",
+              vs->ucode_data_hash(), (uint32_t)bindings.size());
+  for (const auto &b : bindings) {
+    // Live fetch constant for this binding's slot: base address (dwords) + size.
+    uint32_t vb_base_bytes = 0, vb_size_words = 0, endian = 0;
+    if (rf) {
+      auto fetch = rf->GetVertexFetch(b.fetch_constant);
+      vb_base_bytes = fetch.address << 2;  // address is in dwords
+      vb_size_words = fetch.size;          // size in words
+      endian = (uint32_t)fetch.endian;
+    }
+    REXLOG_INFO("[WoS-NATIVE-VTX]   binding {}: fetchConst={} stride={}w attrs={} "
+                "| VB base={:08X} size={}w endian={}",
+                b.binding_index, b.fetch_constant, b.stride_words,
+                (uint32_t)b.attributes.size(), vb_base_bytes, vb_size_words, endian);
+    for (size_t i = 0; i < b.attributes.size(); ++i) {
+      const auto &a = b.attributes[i].fetch_instr.attributes;
+      REXLOG_INFO("[WoS-NATIVE-VTX]     attr {}: fmt={} off={}w stride={}w "
+                  "signed={} int={} expAdj={}",
+                  (uint32_t)i, VertexFormatName(a.data_format), a.offset, a.stride,
+                  a.is_signed ? 1 : 0, a.is_integer ? 1 : 0, a.exp_adjust);
+    }
+
+    // --- A1 plumbing proof: fire ONCE on the simple target geometry -----------
+    // KEY CORRECTION: a vertex-fetch constant's address is a GUEST PHYSICAL
+    // address, not a virtual one. The host pointer is physical_membase + (addr &
+    // 0x1FFFFFFF) (Memory::TranslatePhysical), a FLAT 512 MB host view that is
+    // always mapped - NOT the virtual membase `base`, and NOT in the virtual heap
+    // LookupHeap walks (that's why both readable/committed came back 0 for these
+    // VBs). So translate physically and read from there; the physical view needs
+    // no per-page readability check.
+    if (g_a1_enabled.load(std::memory_order_relaxed) &&
+        !g_a1_done.load(std::memory_order_relaxed) &&
+        vs->ucode_data_hash() == kA1TargetVsHash &&
+        (b.stride_words * 4u) == kA1TargetStrideBytes && vb_base_bytes != 0) {
+      const uint32_t stride_bytes = b.stride_words * 4u;
+      const uint32_t vb_total_bytes = vb_size_words * 4u;
+      uint32_t vcount = vb_total_bytes / stride_bytes;
+      // Draw a small, whole number of triangles; keep it modest for the proof.
+      if (vcount > 99) vcount = 99;
+      vcount -= (vcount % 3);  // whole triangles for a TRIANGLE_LIST
+      const uint32_t need_bytes = vcount * stride_bytes;
+      // Physical address + size must stay inside the 512 MB physical window.
+      const uint32_t phys = vb_base_bytes & 0x1FFFFFFFu;
+      const bool in_phys = (uint64_t(phys) + need_bytes) <= 0x20000000ull;
+      auto *ks = rex::system::kernel_state();
+      const uint8_t *host_vb =
+          (ks && ks->memory() && in_phys)
+              ? ks->memory()->TranslatePhysical<const uint8_t *>(vb_base_bytes)
+              : nullptr;
+      REXLOG_INFO("[WoS-NATIVE-A1] candidate: VB={:08X} phys={:08X} need={}B vcount={} host={}",
+                  vb_base_bytes, phys, need_bytes, vcount, host_vb ? 1 : 0);
+      if (vcount >= 3 && host_vb) {
+        if (!g_a1_done.exchange(true, std::memory_order_acq_rel)) {
+          REXLOG_INFO("[WoS-NATIVE-A1] firing: VS {:016X} VB={:08X} verts={} stride={}B",
+                      vs->ucode_data_hash(), vb_base_bytes, vcount, stride_bytes);
+          RenderOneDrawA1(host_vb, vcount, stride_bytes);
+        }
+      }
+    }
+  }
+}
+
+// Read the shader rexglue has ALREADY resolved + translated for the current draw,
+// straight off the live command processor. This is the real loop-closer: the
+// command processor sets active_vertex/pixel_shader() when it executes the game's
+// PM4 IM_LOAD packets, and each Shader's ucode_data_hash() is exactly the hash in
+// the "Creating graphics pipeline state with VS <hash>, PS <hash>" lines. No
+// container parsing, no re-hashing, no re-translation - we observe rexglue's own
+// resolved state. The IGraphicsSystem interface hides the command processor, so we
+// down-cast to the concrete GraphicsSystem (the only implementation; the title
+// links it). Any step may be null early in boot, so guard every hop.
+void ProbeTranslatedShaders(uint8_t *base) {
+  auto *rt = rex::Runtime::instance();
+  if (!rt) {
+    REXLOG_INFO("[WoS-NATIVE-XLATE] runtime not up yet");
+    return;
+  }
+  auto *igs = rt->graphics_system();
+  if (!igs) {
+    REXLOG_INFO("[WoS-NATIVE-XLATE] graphics system not up yet");
+    return;
+  }
+  auto *gs = static_cast<rex::graphics::GraphicsSystem *>(igs);
+  auto *cp = gs->command_processor();
+  if (!cp) {
+    REXLOG_INFO("[WoS-NATIVE-XLATE] command processor not up yet");
+    return;
+  }
+  rex::graphics::Shader *vs = cp->active_vertex_shader();
+  rex::graphics::Shader *ps = cp->active_pixel_shader();
+  if (vs) {
+    REXLOG_INFO("[WoS-NATIVE-XLATE] active VS hash={:016X} dwords={} "
+                "(== pipeline-cache 'VS <hash>')",
+                vs->ucode_data_hash(), (uint32_t)vs->ucode_dword_count());
+    // Decode the vertex layout this VS expects, from rexglue's own analysis +
+    // the live fetch constants. Observe-only; validates what a native draw binds.
+    ProbeVertexLayout(base, gs, vs);
+  } else {
+    REXLOG_INFO("[WoS-NATIVE-XLATE] no active VS on the command processor");
+  }
+  if (ps) {
+    REXLOG_INFO("[WoS-NATIVE-XLATE] active PS hash={:016X} dwords={} "
+                "(== pipeline-cache 'PS <hash>')",
+                ps->ucode_data_hash(), (uint32_t)ps->ucode_dword_count());
+  } else {
+    REXLOG_INFO("[WoS-NATIVE-XLATE] no active PS on the command processor");
+  }
+
+  // A2 is NOT driven from here anymore: binding rexglue's live, per-submission
+  // transient descriptor sets from the game thread races rexglue's GPU thread that
+  // recycles them (that cross-thread submit crashed with a null descriptor). A2 v2
+  // runs the native draw ON rexglue's own GPU thread, inside IssueDraw (0030 patch),
+  // gated by the wos_native_a2 cvar the patch reads directly. Nothing to do here.
+}
+
+// On the first few draws, dump the device struct's draw-relevant fields and the
+// VS/PS shader containers reached through the confirmed shader-pointer offsets.
+void ProbeDeviceState(uint8_t *base, uint32_t device, bool indexed) {
+  if (!GReadable(device, 13000)) {
+    REXLOG_INFO("[WoS-NATIVE-STATE] device={:08X} not readable", device);
+    return;
+  }
+  uint32_t ib = 0, vb0 = 0, stride_raw = 0, fc0 = 0, fc1 = 0, vs = 0, ps = 0;
+  GTryU32(base, device + kIndexBuffer, &ib);
+  GTryU32(base, device + kStreamObject0, &vb0);
+  GTryU32(base, device + kStreamStride0, &stride_raw);
+  GTryU32(base, device + kFetchConstants + 0, &fc0);
+  GTryU32(base, device + kFetchConstants + 4, &fc1);
+  GTryU32(base, device + kVertexShader, &vs);
+  GTryU32(base, device + kPixelShader, &ps);
+  REXLOG_INFO("[WoS-NATIVE-STATE] device={:08X} ib={:08X} vb0={:08X} stride0={} fc0={:08X} fc1={:08X}",
+              device, ib, vb0, stride_raw >> 24, fc0, fc1);
+  REXLOG_INFO("[WoS-NATIVE-STATE] VS@{}={:08X} PS@{}={:08X}", kVertexShader, vs, kPixelShader, ps);
+  // Follow the shader-object pointers to their 0x102A1100 containers (safe reads).
+  // This is the GAME's D3D view - ground truth for which shader each draw uses.
+  ResolveShaderObject(base, vs, false);
+  ResolveShaderObject(base, ps, true);
+  // ...and read what REXGLUE already resolved+translated for this draw. The two
+  // describe the same shader from the two ends of the pipe; the XLATE hash is the
+  // one that matches rexglue's pipeline-cache lines and gets us the SPIR-V.
+  ProbeTranslatedShaders(base);
+  (void)indexed;
+}
+
+}  // namespace
+
+// Turn the native path on/off. Called once at startup from the app layer after
+// cvars are loaded. Reading the cvar here (not per-draw) keeps the hooks cheap.
+void Configure() {
+  g_enabled.store(REXCVAR_GET(wos_native), std::memory_order_relaxed);
+  g_a1_enabled.store(REXCVAR_GET(wos_native_a1), std::memory_order_relaxed);
+  // A2 is handled inside rexglue (its own wos_native_a2 cvar), not here.
+  REXLOG_INFO("[WoS-NATIVE] native renderer {}{}",
+              g_enabled.load() ? "ON (observing draws)" : "off",
+              g_a1_enabled.load() ? " +A1 (one offscreen plumbing draw)" : "");
+  if (g_enabled.load()) {
+    prospero_startup_log("native: renderer on - intercepting D3D draws (prototype: observe+log)");
+  }
+}
+
+// Public wrapper so the file-scope extern "C" hooks can reach the probe. We probe
+// the first few draws AND a sample of later ones. The later samples matter because
+// rexglue analyzes a shader's ucode lazily (on its own GPU thread, at pipeline
+// build time), so a VS caught on its very first draw may not be analyzed yet -
+// its layout shows up once we re-observe it a bit later. We deliberately do NOT
+// force AnalyzeUcode from this (the game's draw) thread: it takes no lock and
+// would race rexglue's GPU thread analyzing the same shader. Sampling later draws
+// catches it safely after rexglue has done the analysis itself.
+void ProbeFirstDraws(uint8_t *base, uint32_t device, uint64_t n, bool indexed) {
+  if (n <= 4 || (n & 4095) == 0) {
+    ProbeDeviceState(base, device, indexed);
+  }
+}
+
+uint64_t DrawCallCount() { return g_draw_calls.load(std::memory_order_relaxed); }
+uint64_t IndexedDrawCallCount() { return g_indexed_draw_calls.load(std::memory_order_relaxed); }
+
+}  // namespace native
+}  // namespace wos
+
+// --- The hooks: strong overrides of the recompiler's weak guest symbols --------
+//
+// Signature matches REX_FUNC: (PPCContext&, uint8_t* base). The original is the
+// __imp__ alias the recompiler always emits alongside the weak symbol.
+
+extern "C" void __imp__sub_82ABECF0(PPCContext &ctx, uint8_t *base);  // DrawVertices
+extern "C" void __imp__sub_82ABF0E0(PPCContext &ctx, uint8_t *base);  // DrawIndexedVertices
+extern "C" void wos_eot_DrawVertices(PPCContext &ctx, uint8_t *base);         // the native
+extern "C" void wos_eot_DrawIndexedVertices(PPCContext &ctx, uint8_t *base);  // renderer's
+namespace wos::native_renderer {
+bool Enabled();             // wos_ps5_native_renderer.cpp
+void FlushRingConstants(uint32_t device);  // ditto: SET_CONSTANT packets -> the shadow
+void NoteStreamCursor(uint32_t device);
+}
+namespace wos::capture {
+void Call(const char *name, const PPCContext &ctx, uint8_t *base, bool draw);
+bool Active();
+void NoteBlob(uint32_t kind, uint32_t key, const uint8_t *data, uint32_t bytes);
+}
+
+// fix52: on the emulated renderer, record the game's draws in L3+R3 captures (call + device
+// snapshot, blob 11 = guest call stack keyed by draw order) to compare with a native capture.
+namespace wos::native_renderer {
+uint32_t GuestCallStack(uint8_t out[16 * 4]);  // wos_ps5_native_renderer.cpp
+void NoteDrawItem(uint32_t key, uint32_t device);  // fix92/94
+void NoteDrawConstantsAfter(uint32_t key, uint32_t device);  // fix98
+}
+namespace {
+uint32_t CaptureEmulatedDraw(const char *name, PPCContext &ctx, uint8_t *base) {
+  if (!wos::capture::Active())
+    return ~0u;
+  static std::atomic<uint32_t> serial{0};
+  wos::capture::Call(name, ctx, base, true);
+  uint8_t stack[16 * 4];
+  const uint32_t key = serial.fetch_add(1, std::memory_order_relaxed);
+  if (const uint32_t n = wos::native_renderer::GuestCallStack(stack))
+    wos::capture::NoteBlob(11, key, stack, 4 * n);
+  wos::native_renderer::NoteDrawItem(key, ctx.r3.u32);  // fix92/94
+  return key;
+}
+}  // namespace
+
+// D3DDevice::DrawVertices(device, primType, startVertex, vertexCount)
+//   r3=device, r4=primType, r5=startVertex, r6=vertexCount
+extern "C" int wos_facade_occlusion();  // fix116 (wos_ps5_native_renderer.cpp)
+extern "C" bool wos_facade_hidden(uint32_t device, uint32_t prim, uint32_t start, uint32_t count);
+extern "C" void sub_82ABECF0(PPCContext &ctx, uint8_t *base) {
+  if (wos::native_renderer::Enabled()) {
+    const uint32_t device = ctx.r3.u32;
+    wos::native_renderer::FlushRingConstants(device);
+    // fix116: a window strip hidden behind nearer buildings - neither the game's D3D call
+    // (its pending state stays pending for the next draw) nor the renderer's
+    static const int facade_occlusion = wos_facade_occlusion();
+    if (facade_occlusion >= 2 && ctx.r4.u32 == 13 &&
+        wos_facade_hidden(device, 13, ctx.r5.u32, ctx.r6.u32))
+      return;
+    wos::capture::Call("DrawVertices", ctx, base, true);
+    wos_eot_DrawVertices(ctx, base);
+    wos::native_renderer::NoteStreamCursor(device);
+    return;
+  }
+  if (wos::native::g_enabled.load(std::memory_order_relaxed)) {
+    const uint64_t n = ++wos::native::g_draw_calls;
+    if (wos::native::ShouldLog(n)) {
+      REXLOG_INFO("[WoS-NATIVE] DrawVertices #{}: device={:08X} prim={} startVtx={} count={}",
+                  n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32);
+    }
+    wos::native::ProbeFirstDraws(base, ctx.r3.u32, n, false);
+  }
+  const uint32_t dev98 = ctx.r3.u32;
+  const uint32_t key98 = CaptureEmulatedDraw("DrawVertices", ctx, base);  // fix52
+  // Still run the real draw so the game renders normally (prototype = observe).
+  __imp__sub_82ABECF0(ctx, base);
+  if (key98 != ~0u)
+    wos::native_renderer::NoteDrawConstantsAfter(key98, dev98);  // fix98
+}
+
+// fix118 (wos_strip_merge): the game's window-strip loop. sub_8291F508 draws a render item;
+// for the city's facade meshes it walks a list of {first vertex, vertex count} pairs (ended by
+// a negative first vertex) and calls DrawVertices once per pair, with nothing changed between
+// the calls - same device state, same constants. tools/strip-merge-patch.py points that one
+// call (at 0x8291F948) here, with the list. 0 = the game's loop as it was; 1 = the whole list
+// is one draw (an index list over its ranges: the strips are never next to each other in the
+// vertex buffer - fix118 run: 0 adjacent, ~223 vertices between them); 2 = as 0, counting.
+// Returns the list pointer the game's loop goes on from: the last pair (it adds 8 and reads
+// the terminator), so the loop ends.
+extern "C" int wos_strip_merge();  // wos_ps5_native_renderer.cpp
+extern "C" void wos_eot_DrawVertexRanges(PPCContext &ctx, uint8_t *base, const uint32_t *ranges,
+                                         uint32_t range_count);  // gpu/hooks/state.cpp
+namespace {
+struct StripMergeStats {
+  std::atomic<uint64_t> lists{0}, pairs{0}, draws{0}, adjacent{0}, gaps{0}, gap_vertices{0},
+      other_prim{0};
+};
+StripMergeStats g_strip_merge;
+inline uint32_t StripLoad(uint8_t *base, uint32_t va) {
+  return __builtin_bswap32(*reinterpret_cast<volatile uint32_t *>(
+      base + va + (va >= 0xE0000000u ? 0x1000u : 0u)));
+}
+}  // namespace
+extern "C" uint32_t wos_draw_vertex_list(PPCContext &ctx, uint8_t *base, uint32_t list) {
+  static const int mode = wos_strip_merge();
+  const uint32_t prim = ctx.r4.u32;
+  // point, line, triangle and quad lists (13 = the strips)
+  const bool list_prim = prim == 1 || prim == 2 || prim == 4 || prim == 13;
+  if (mode <= 0 || !list_prim || !wos::native_renderer::Enabled()) {
+    if (mode > 0)
+      g_strip_merge.other_prim.fetch_add(1, std::memory_order_relaxed);
+    sub_82ABECF0(ctx, base);
+    return list;
+  }
+  const uint32_t device = ctx.r3.u32;
+  constexpr uint32_t kMaxRanges = 256;
+  uint32_t ranges[2 * kMaxRanges];
+  uint32_t n = 0;
+  uint64_t pairs = 0, draws = 0, adjacent = 0, gaps = 0, gap_vertices = 0;
+  // one draw of the ranges collected so far (mode 1)
+  auto flush = [&] {
+    if (!n)
+      return;
+    ctx.r3.u64 = device;
+    ctx.r4.u64 = prim;
+    ctx.r5.u64 = ranges[0];
+    ctx.r6.u64 = ranges[1];
+    wos::native_renderer::FlushRingConstants(device);
+    wos::capture::Call("DrawVertices", ctx, base, true);
+    if (n == 1)
+      wos_eot_DrawVertices(ctx, base);
+    else
+      wos_eot_DrawVertexRanges(ctx, base, ranges, n);
+    wos::native_renderer::NoteStreamCursor(device);
+    ++draws;
+    n = 0;
+  };
+  uint32_t p = list, prev_end = 0;
+  for (;; p += 8) {
+    const int32_t first = static_cast<int32_t>(StripLoad(base, p));
+    if (first < 0)
+      break;
+    const uint32_t count = StripLoad(base, p + 4);
+    if (pairs) {
+      if (static_cast<uint32_t>(first) == prev_end) {
+        ++adjacent;
+      } else {
+        ++gaps;
+        if (static_cast<uint32_t>(first) > prev_end)
+          gap_vertices += static_cast<uint32_t>(first) - prev_end;
+      }
+    }
+    ++pairs;
+    prev_end = static_cast<uint32_t>(first) + count;
+    if (mode == 1) {
+      if (n == kMaxRanges)
+        flush();
+      ranges[2 * n] = static_cast<uint32_t>(first);
+      ranges[2 * n + 1] = count;
+      ++n;
+    } else {
+      // mode 2: the game's own draw for each pair
+      ctx.r3.u64 = device;
+      ctx.r4.u64 = prim;
+      ctx.r5.u64 = static_cast<uint32_t>(first);
+      ctx.r6.u64 = count;
+      sub_82ABECF0(ctx, base);
+      ++draws;
+    }
+  }
+  flush();
+  auto &st = g_strip_merge;
+  const uint64_t lists = st.lists.fetch_add(1, std::memory_order_relaxed) + 1;
+  st.pairs.fetch_add(pairs, std::memory_order_relaxed);
+  st.draws.fetch_add(draws, std::memory_order_relaxed);
+  st.adjacent.fetch_add(adjacent, std::memory_order_relaxed);
+  st.gaps.fetch_add(gaps, std::memory_order_relaxed);
+  st.gap_vertices.fetch_add(gap_vertices, std::memory_order_relaxed);
+  if ((lists & 0x3FFFFu) == 0) {
+    const uint64_t pr = st.pairs.load(std::memory_order_relaxed);
+    const uint64_t dr = st.draws.load(std::memory_order_relaxed);
+    const uint64_t ad = st.adjacent.load(std::memory_order_relaxed);
+    const uint64_t ga = st.gaps.load(std::memory_order_relaxed);
+    REXLOG_INFO("[strip-merge] mode {}: {} strip lists, {} strips -> {} draws ({:.0f}% fewer); "
+                "next strip adjacent {} times, after a gap {} ({:.1f} vertices per gap); "
+                "{} lists of other primitives drawn as they were",
+                mode, lists, pr, dr, pr ? 100.0 - 100.0 * dr / pr : 0.0, ad, ga,
+                ga ? double(st.gap_vertices.load(std::memory_order_relaxed)) / ga : 0.0,
+                st.other_prim.load(std::memory_order_relaxed));
+  }
+  return p - 8;
+}
+
+// D3DDevice::DrawIndexedVertices(device, primType, baseVertexIndex, startIndex, indexCount)
+//   r3=device, r4=primType, r5=baseVertexIndex, r6=startIndex, r7=indexCount
+extern "C" void sub_82ABF0E0(PPCContext &ctx, uint8_t *base) {
+  if (wos::native_renderer::Enabled()) {
+    const uint32_t device = ctx.r3.u32;
+    wos::native_renderer::FlushRingConstants(device);
+    wos::capture::Call("DrawIndexedVertices", ctx, base, true);
+    wos_eot_DrawIndexedVertices(ctx, base);
+    wos::native_renderer::NoteStreamCursor(device);
+    return;
+  }
+  if (wos::native::g_enabled.load(std::memory_order_relaxed)) {
+    const uint64_t n = ++wos::native::g_indexed_draw_calls;
+    if (wos::native::ShouldLog(n)) {
+      REXLOG_INFO("[WoS-NATIVE] DrawIndexedVertices #{}: device={:08X} prim={} baseVtx={} "
+                  "startIdx={} idxCount={}",
+                  n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32);
+    }
+    wos::native::ProbeFirstDraws(base, ctx.r3.u32, n, true);
+  }
+  const uint32_t dev98 = ctx.r3.u32;
+  const uint32_t key98 = CaptureEmulatedDraw("DrawIndexedVertices", ctx, base);  // fix52
+  __imp__sub_82ABF0E0(ctx, base);
+  if (key98 != ~0u)
+    wos::native_renderer::NoteDrawConstantsAfter(key98, dev98);  // fix98
+}

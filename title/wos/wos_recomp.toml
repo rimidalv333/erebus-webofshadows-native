@@ -1,0 +1,110 @@
+# Spider-Man: Web of Shadows (recompiled) for the PS5 - settings.
+#
+# This file sits beside eboot.bin (/data/homebrew/PPSA99310/wos_recomp.toml on the
+# console) and is read at every launch. Edit it over FTP; a line removed falls
+# back to the title's own choice (wos/app/wos_ps5_app.cpp), not the runtime's.
+
+# --- The picture -----------------------------------------------------------------
+
+# Internal resolution, as a multiple of the game's 1280x720: 1 (720p), 2 (1440p),
+# 3 (4K). 2 is the recommended default - it looks far sharper than 720p on a 4K
+# screen and the PS5 holds it comfortably. 3 is native 4K but costs GPU time in
+# the heaviest scenes; 1 is the lightest.
+draw_resolution_scale_x = 2
+draw_resolution_scale_y = 2
+
+# How the game's picture is scaled to the screen. The PS5 runtime is built
+# without AMD FidelityFX, so "bilinear" is the only choice here.
+present_effect = "bilinear"
+
+# Anisotropic filtering: -1 the game's own, 0 off, 1..5 = 1x, 2x, 4x, 8x, 16x
+anisotropic_override = 4
+
+# --- The emulated GPU (Vulkan on the console's RADV) ----------------------------
+
+# "fsi" (fragment shader interlock, the default here) or "fbo". With "fbo" the
+# cutscenes and the title screen are black. Change only to compare.
+render_target_path_vulkan = "fsi"
+
+# One allocation for the GPU's copy of guest memory (false), or sparse binding (true)
+vulkan_sparse_shared_memory = false
+
+# Compile the game's shaders in the background (true): a moment of missing
+# objects the first time an effect appears, instead of a stall
+async_shader_compilation = true
+
+# --- Performance ----------------------------------------------------------------
+
+# Record and submit the GPU's command buffers on a thread of their own, beside the
+# emulated GPU's command processor (true), instead of on it
+vulkan_async_submission = true
+
+# --- The display ------------------------------------------------------------------
+
+vsync = true
+
+# The refresh rate the game is told its TV runs at. 60 gives a rock-solid, fully
+# correct 30 fps (the game presents every second refresh) - the default, and the
+# most faithful. 120 is the PERFORMANCE MODE: the game presents every refresh for
+# a higher, variable frame rate (roughly 35-60). Game logic then runs a little
+# faster, the way the PC port does; timed missions stay doable. One line to switch.
+video_mode_refresh_rate = 60
+
+# --- Frame pacing ---------------------------------------------------------------
+
+# true: the game's vblank taken from the display's instead of the emulator's own
+# 60 Hz timer (which drifts against the 59.94 Hz output), and every frame on
+# screen for at least two vblanks (one right after a late frame waits instead of
+# showing for a single refresh).
+# The log's "display:" lines show how long frames stay on screen either way.
+wos_display_pacing = true
+
+# --- Diagnostics ----------------------------------------------------------------
+
+# true: collect and log performance diagnostics - the per-frame fps/timing lines,
+# the per-draw timing probes, the hitch log. Off for normal play so a release
+# build pays nothing for them; turn on to measure. wos_profile implies this.
+wos_diagnostics = false
+
+# true: profile the emulated GPU's command processor into wos-profile.txt beside
+# eboot.bin (for wos/tools/profile-report.py). Turns diagnostics on as well.
+# Costs speed - leave it off to play.
+wos_profile = false
+
+# --- Native renderer (experimental) ---------------------------------------------
+
+# true: intercept the game's D3D draw calls directly, before they become Xbox 360
+# GPU commands, toward drawing them on the PS5's GPU without the single-threaded
+# command-buffer emulation that limits the frame rate. PROTOTYPE: currently only
+# observes and logs the draws (the game still renders through emulation), to prove
+# interception works. The "Native" title (PPSA99311) sets this; leave it off here.
+wos_native = false
+# A1 offscreen plumbing proof (see the Native title's toml). Off for normal play.
+wos_native_a1 = false
+# A2 real-shader proof (see the Native title's toml). Off for normal play.
+wos_native_a2 = false
+
+# --- Shader capture (developer) -------------------------------------------------
+
+# A path (e.g. "/app0/shaderdump") to write every shader the emulated GPU
+# translates: the clean raw Xbox 360 ucode (shader_<hash>.ucode.bin.vert/frag) and
+# the GPU's own translated SPIR-V + disassembly. This is the correctly-located
+# microcode and a known-good SPIR-V reference for native-renderer work - the form
+# a static byte scan of the game packs cannot give. Empty = off. Leave off for
+# normal play; the dump writes a file per shader the first time each is seen.
+dump_shaders = ""
+
+# true: once a level has loaded, scan guest memory for the game's Xbox 360
+# shaders (which the game decompresses from its .XEPACK packs into RAM) and write
+# each to wos-shaders.bin beside eboot.bin, readable over FTP. For a PC-side
+# XenosRecomp run toward a native renderer. Off for normal play - a scan walks all
+# of guest memory. Scans a few times over the first few minutes; play past the
+# menu into a level to capture the gameplay shaders.
+wos_shader_dump = false
+
+# --- Texture mods ---------------------------------------------------------------
+
+# true: write every texture the game loads to mods/dump/ beside eboot.bin (once each,
+# as the Xbox 360 keeps it), for wos/tools/wos_textures.py to turn into PNGs. A file
+# mods/textures/<fingerprint>.bin replaces the texture with that fingerprint either way.
+wos_texture_dump = false

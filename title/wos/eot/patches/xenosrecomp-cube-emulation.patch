@@ -1,0 +1,95 @@
+diff -ru a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+--- a/XenosRecomp/shader_common.h	2026-11-06 14:34:42.343555169 +0000
++++ b/XenosRecomp/shader_common.h	2026-11-06 14:34:42.345309150 +0000
+@@ -299,9 +299,25 @@
+     uint cubeMapIndex;
+ };
+ 
++// WoS: tfetchCube as the emulator does it - texCoord is the Xenos cube face coordinates
++// (S/T in 1..2, face index in z) the shader computed from the cube instruction; turned back
++// into a 3D vector on the unit cube, sampled with coarse explicit gradients.
+ float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, inout CubeMapData cubeMapData)
+ {
+-    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeMapData.cubeMapDirections[texCoord.z]);
++    float sc = texCoord.x * 2.0 - 3.0;
++    float tc = texCoord.y * 2.0 - 3.0;
++    uint face = isnan(texCoord.z) ? 0u : uint(clamp(texCoord.z, 0.0, 5.0));
++    bool negative = (face & 1u) != 0u;
++    float faceSign = negative ? -1.0 : 1.0;
++    float3 coord;
++    if ((face >> 1) == 0u)
++        coord = float3(faceSign, -tc, negative ? sc : -sc);
++    else if ((face >> 1) == 1u)
++        coord = float3(sc, faceSign, negative ? -tc : tc);
++    else
++        coord = float3(negative ? -sc : sc, -tc, faceSign);
++    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].SampleGrad(g_SamplerDescriptorHeap[samplerDescriptorIndex],
++        coord, ddx_coarse(coord), ddy_coarse(coord));
+ }
+ 
+ #ifdef REEOT_RECOMP
+@@ -361,13 +377,23 @@
+ }
+ #endif
+ 
++// WoS: the Xenos cube instruction (operand already swizzled, .z_xy): returns T, S,
++// 2 * major axis, face index - the emulator's (and the hardware's) result.
+ float4 cube(float4 value, inout CubeMapData cubeMapData)
+ {
+-    uint index = cubeMapData.cubeMapIndex;
+-    cubeMapData.cubeMapDirections[index] = value.xyz;
+-    ++cubeMapData.cubeMapIndex;
+-    
+-    return float4(0.0, 0.0, 0.0, index);
++    float x = value.z;
++    float y = value.w;
++    float z = value.x;
++    float ax = abs(x), ay = abs(y), az = abs(z);
++    float4 r;
++    if (az >= ax && az >= ay)
++        r = float4(-y, z < 0.0 ? -x : x, z, z < 0.0 ? 5.0 : 4.0);
++    else if (ay >= ax)
++        r = float4(y < 0.0 ? -z : z, x, y, y < 0.0 ? 3.0 : 2.0);
++    else
++        r = float4(-y, x < 0.0 ? z : -z, x, x < 0.0 ? 1.0 : 0.0);
++    r.z *= 2.0;
++    return r;
+ }
+ 
+ float4 dst(float4 src0, float4 src1)
+diff -ru a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+--- a/XenosRecomp/shader_recompiler.cpp	2026-11-06 14:34:42.341901487 +0000
++++ b/XenosRecomp/shader_recompiler.cpp	2026-11-06 14:34:42.345250656 +0000
+@@ -701,6 +701,7 @@
+ 
+                 case AluVectorOpcode::Dp4:
+                 case AluVectorOpcode::Max4:
++                case AluVectorOpcode::Cube:  // WoS: the whole swizzled operand (.z_xy)
+                     mask = 0b1111;
+                     break;
+ 
+@@ -973,20 +974,10 @@
+             break;
+ 
+         case AluVectorOpcode::Cube:
+-            // WoS: the cube's source can be a constant (src1Select clear), not only a register
+-            if (instr.src1Select)
+-                print("cube(r{}, cubeMapData)", instr.src1Register & 0x3F);
+-            else
+-            {
+-                auto c = float4Constants.find(instr.src1Register);
+-                if (c != float4Constants.end() && c->second->registerCount <= 1)
+-                    print("cube({}, cubeMapData)", reinterpret_cast<const char*>(constantTableData + c->second->name));
+-                else if (c != float4Constants.end())
+-                    print("cube({}({}), cubeMapData)", reinterpret_cast<const char*>(constantTableData + c->second->name),
+-                        instr.src1Register - c->second->registerIndex);
+-                else
+-                    print("cube(c{}, cubeMapData)", instr.src1Register);
+-            }
++            // WoS: the real Xenos cube instruction on the swizzled operand (.z_xy = z, -, x, y),
++            // as the emulator does - XenosRecomp passed the bare register's .xyz, wrong for any
++            // other swizzle (the facade glass shader 5f18a4e3ead2ec0c uses r3.wwxz).
++            print("cube({}, cubeMapData)", op(VECTOR_0));
+             break;
+ 
+         case AluVectorOpcode::Max4:

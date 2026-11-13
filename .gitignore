@@ -1,0 +1,7 @@
+wos-build/
+PPSA31622/
+PPSA31622.partial/
+/deps/
+/deps.partial/
+/deps-archive.partial/
+*.iso

@@ -1,0 +1,2637 @@
+This title's changes to the ReXGlue fork at f47ccdd, in one patch (applied by
+wos/tools/build-rexglue.sh). Made from these, applied in order:
+  0001-vulkan-storage-seek-before-write.patch
+  0002-gpu-perf-probe.patch
+  0003-gpu-perf-probe-breakdown.patch
+  0004-gpu-perf-probe-draw-steps-memory.patch
+  0005-shared-memory-probe.patch
+  0006-shared-memory-lock-free-fast-path.patch
+  0007-ps5-event-pulse-without-sleep.patch
+  0008-texture-dump-and-replace.patch
+  0009-texture-mods-on-every-load-path.patch
+  0010-texture-mods-invalidate-shared-memory.patch
+  0011-vulkan-async-submission.patch
+  0012-vulkan-reuse-texture-descriptor-sets.patch
+  0013-command-processor-hot-spots.patch
+  0014-vulkan-dynamic-constant-buffers.patch
+  0015-float-constants-copied-in-runs.patch
+  0016-presenter-pipeline-kept-for-its-format.patch
+  0019-hitch-counters.patch
+  0020-skip-unchanged-constants-and-mod-hashing.patch
+  0021-constant-buffers-in-one-upload-page.patch
+  0022-achievement-toast-drawer-only-while-showing.patch
+  0023-guest-vblank-follows-the-display.patch
+  0024-sampler-reuse-and-cheaper-register-writes.patch
+  0026-skip-scaled-resolve-checks-when-none-exist.patch
+  0027-skip-mprotect-when-pages-already-have-the-access.patch
+  0028-diagnostics-master-switch.patch
+  0029-dump-shaders-on-vulkan.patch
+  0030-native-draw-snapshot.patch
+(0017/0018, frame generation, are left out of this release.)
+
+diff --git a/include/rex/graphics/pipeline/texture/cache.h b/include/rex/graphics/pipeline/texture/cache.h
+index d26cd4fbafbe7d19ba52391afd913f402220f834..6fd29800c7efe9443ea829ed35ae3dbba381db03 100644
+--- a/include/rex/graphics/pipeline/texture/cache.h
++++ b/include/rex/graphics/pipeline/texture/cache.h
+@@ -596,6 +596,14 @@ class TextureCache {
+   // >> 12 for 4 KB pages, >> 5 for uint32_t level 1 bits, >> 6 for uint64_t
+   // level 2 bits.
+   uint64_t scaled_resolve_pages_l2_[SharedMemory::kBufferSize >> (12 + 5 + 6)];
++  // WebOfShadowsRecomp (0026): how many level-2 blocks hold any scaled-resolve
++  // page, maintained under global_critical_region_ wherever the bitmaps change.
++  // Read relaxed to skip the lock and the guest-layout work in
++  // FindOrCreateTexture / IsRangeScaledResolved when nothing is scaled-resolved
++  // (the usual case for a title that resolves little or nothing scaled). A stale
++  // read can only cause an extra locked check that then finds nothing, never a
++  // missed scaled-resolve page for a draw that needs one.
++  std::atomic<uint32_t> wos_scaled_resolve_l2_set_count_{0};
+ 
+   // Global watch for scaled resolve data invalidation.
+   SharedMemory::GlobalWatchHandle scaled_resolve_global_watch_handle_ = nullptr;
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 696ff481c12369287f7c8096cba8daf15b50c68c..9b84200382ac963f33240548077c005fb497824f 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -45,6 +45,8 @@
+ 
+ namespace rex::graphics::vulkan {
+ 
++struct WosAsyncSubmitter;
++
+ class VulkanCommandProcessor : public CommandProcessor {
+  public:
+   // Single-descriptor layouts for use within a single frame.
+@@ -168,6 +170,36 @@ class VulkanCommandProcessor : public CommandProcessor {
+   uint64_t GetCurrentFrame() const { return frame_current_; }
+   uint64_t GetCompletedFrame() const { return frame_completed_; }
+ 
++  // WebOfShadowsRecomp native renderer (A2/B): a read-only snapshot of everything
++  // the last successfully-configured guest draw needs, captured in IssueDraw right
++  // after UpdateBindings (pipeline + layout + descriptor sets all valid, before the
++  // draw is emitted). The title's native path binds exactly these to its own
++  // command buffer / offscreen target instead of reproducing the (intricate)
++  // constant and binding state by hand. Only the NON-INDEXED path is captured for
++  // now (wos_native_last_valid is false for indexed draws). Nothing here mutates
++  // emulator state; it is pure observation.
++  struct WosNativeDrawSnapshot {
++    bool valid = false;            // a non-indexed guest draw was captured
++    VkPipeline pipeline = VK_NULL_HANDLE;
++    VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
++    VkDescriptorSet descriptor_sets[SpirvShaderTranslator::kDescriptorSetCount] = {};
++    uint32_t descriptor_set_count = 0;
++    uint32_t host_vertex_count = 0;  // for vkCmdDraw(host_vertex_count, 1, 0, 0)
++    uint64_t vertex_shader_hash = 0;
++    uint64_t pixel_shader_hash = 0;
++    // The guest render pass + framebuffer the pipeline was built against. The
++    // pipeline is only valid inside a render pass COMPATIBLE with this one, so the
++    // native path must render into this render pass (into a compatible framebuffer
++    // of its own, or - for a direct on-screen draw - this very framebuffer).
++    VkRenderPass render_pass = VK_NULL_HANDLE;
++    VkFramebuffer framebuffer = VK_NULL_HANDLE;
++    uint32_t fb_width = 0;
++    uint32_t fb_height = 0;
++  };
++  const WosNativeDrawSnapshot& wos_native_draw_snapshot() const {
++    return wos_native_draw_snapshot_;
++  }
++
+   // Submission must be open to insert barriers. If no pipeline stages access
+   // the resource in a synchronization scope, the stage masks should be 0 (top /
+   // bottom of pipe should be specified only if explicitly needed). Returning
+@@ -552,6 +584,35 @@ class VulkanCommandProcessor : public CommandProcessor {
+   std::vector<CommandBuffer> command_buffers_writable_;
+   std::deque<std::pair<uint64_t, CommandBuffer>> command_buffers_submitted_;
+   DeferredCommandBuffer deferred_command_buffer_;
++  // WebOfShadowsRecomp: submissions other than swaps are recorded into their
++  // Vulkan command buffer and submitted on a thread of their own
++  // (vulkan_async_submission).
++  std::unique_ptr<WosAsyncSubmitter> wos_async_submitter_;
++  // WebOfShadowsRecomp: the texture descriptor set last written for each stage
++  // (vertex, pixel), reused in the same frame while the draw's textures and
++  // samplers are the same.
++  struct WosTextureBindingCache {
++    VkDescriptorSet set = VK_NULL_HANDLE;
++    uint64_t frame = 0;
++    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
++    uint32_t texture_count = 0;
++    uint32_t sampler_count = 0;
++    std::vector<VkDescriptorImageInfo> infos;
++  };
++  WosTextureBindingCache wos_texture_binding_cache_[2];
++  // WebOfShadowsRecomp (0014): the guest draw constants are dynamic uniform
++  // buffers: a descriptor set per combination of upload buffer pages (written
++  // once, from wos_constants_pool_), bound with each draw's offsets.
++  struct WosConstantsSet {
++    VkBuffer buffers[SpirvShaderTranslator::kConstantBufferCount];
++    VkDescriptorSet set;
++  };
++  VkDescriptorPool wos_constants_pool_ = VK_NULL_HANDLE;
++  std::vector<WosConstantsSet> wos_constants_sets_;
++  uint32_t wos_constants_offsets_[SpirvShaderTranslator::kConstantBufferCount] = {};
++  // Submissions the submitter thread has not submitted yet, after waiting for
++  // all of them if drain.
++  uint64_t WosAsyncSubmissionsPending(bool drain);
+ 
+   std::vector<VkSparseMemoryBind> sparse_memory_binds_;
+   std::vector<SparseBufferBind> sparse_buffer_binds_;
+@@ -787,6 +848,16 @@ class VulkanCommandProcessor : public CommandProcessor {
+   // Currently used samplers.
+   std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>> current_samplers_vertex_;
+   std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>> current_samplers_pixel_;
++  // WebOfShadowsRecomp (0024): the sampler lists above are rebuilt from the
++  // fetch constants only when the shaders or the fetch constants changed since
++  // the last draw - consecutive draws usually share both. The parameters stay
++  // valid; only the VkSampler handles (and their last-usage submission) are
++  // refreshed each draw through UseSampler. Set whenever a fetch constant is
++  // written (WriteRegister / WriteRegistersFromMem) or the override changes.
++  bool wos_samplers_valid_ = false;
++  const VulkanShader* wos_samplers_vertex_shader_ = nullptr;
++  const VulkanShader* wos_samplers_pixel_shader_ = nullptr;
++  int32_t wos_samplers_anisotropic_override_ = -2;
+ 
+   // Cache render pass currently started in the command buffer with the
+   // framebuffer. For dynamic rendering, current_render_pass_ is VK_NULL_HANDLE
+@@ -812,6 +883,14 @@ class VulkanCommandProcessor : public CommandProcessor {
+   // the buffer infos in current_constant_buffer_infos_ point to them.
+   uint32_t current_constant_buffers_up_to_date_;
+   VkDescriptorSet current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetCount];
++  // WebOfShadowsRecomp native renderer (A2/B): snapshot of the last non-indexed
++  // guest draw's pipeline/layout/descriptor-sets, captured in IssueDraw.
++  WosNativeDrawSnapshot wos_native_draw_snapshot_;
++  bool wos_native_a2_done_ = false;   // A2 proof runs exactly once
++  bool wos_native_a2_indexed_done_ = false;
++  // A2 proof: re-render the snapshot draw once into our own offscreen image, on
++  // this thread; logs the rendered pixel count. Defined in command_processor.cpp.
++  void WosNativeA2ProofOnce();
+   // Whether descriptor sets in current_graphics_descriptor_sets_ point to
+   // up-to-date data.
+   uint32_t current_graphics_descriptor_set_values_up_to_date_;
+diff --git a/include/rex/graphics/vulkan/deferred_command_buffer.h b/include/rex/graphics/vulkan/deferred_command_buffer.h
+index 9d2a8485638bae58b43636f0690e56625ef71b05..a619b239f553bcaacd384b9eac8519b423d1469e 100644
+--- a/include/rex/graphics/vulkan/deferred_command_buffer.h
++++ b/include/rex/graphics/vulkan/deferred_command_buffer.h
+@@ -29,6 +29,9 @@ class DeferredCommandBuffer {
+                         size_t initial_size_bytes = 1024 * 1024);
+ 
+   void Reset();
++  // WebOfShadowsRecomp: hands the recorded commands to another buffer (and takes
++  // its, emptied), for recording them into a Vulkan command buffer elsewhere.
++  void Swap(DeferredCommandBuffer& other) { command_stream_.swap(other.command_stream_); }
+   void Execute(VkCommandBuffer command_buffer);
+ 
+   // render_pass_begin->pNext of all barriers must be null.
+diff --git a/include/rex/graphics/vulkan/texture_cache.h b/include/rex/graphics/vulkan/texture_cache.h
+index 04856ee7e87ecedf646c9d51f85e448ef75aa5ff..ae09842c485f1260d0d3da76e28338747e293d11 100644
+--- a/include/rex/graphics/vulkan/texture_cache.h
++++ b/include/rex/graphics/vulkan/texture_cache.h
+@@ -90,6 +90,8 @@ class VulkanTextureCache final : public TextureCache {
+                                               xenos::FetchOpDimension dimension, bool is_signed);
+ 
+   SamplerParameters GetSamplerParameters(const VulkanShader::SamplerBinding& binding) const;
++  // WebOfShadowsRecomp (0013): GetSamplerParameters without its cache.
++  SamplerParameters GetSamplerParametersUncached(const VulkanShader::SamplerBinding& binding) const;
+ 
+   // Must be called for every used sampler at least once in a single submission,
+   // and a submission must be open for this to be callable.
+diff --git a/include/rex/graphics/vulkan/wos_native_snapshot.h b/include/rex/graphics/vulkan/wos_native_snapshot.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..8b7f2208918e0e7947a782dfee98f0c7b620cee6
+--- /dev/null
++++ b/include/rex/graphics/vulkan/wos_native_snapshot.h
+@@ -0,0 +1,51 @@
++// WebOfShadowsRecomp native renderer (A2/B) -- a LIGHT, standalone view of the
++// emulated GPU's current-draw state, for the title's native renderer.
++//
++// The title must not include the full command_processor.h (it drags in the SPIR-V
++// translator / glslang headers that aren't on the title's include path). This
++// header exposes only a POD snapshot + a free getter, declared with lightweight
++// Vulkan + system types. The getter reads the command processor's internal
++// snapshot (populated in IssueDraw) and copies it out. Pure observation.
++//
++// Added by wos/patches/rexglue/0030-native-draw-snapshot.patch.
++#ifndef REX_GRAPHICS_VULKAN_WOS_NATIVE_SNAPSHOT_H_
++#define REX_GRAPHICS_VULKAN_WOS_NATIVE_SNAPSHOT_H_
++
++#include <cstdint>
++
++#include <rex/ui/vulkan/api.h>  // Vulkan types via the bundled headers + beta macros
++
++namespace rex {
++namespace system {
++class IGraphicsSystem;
++}  // namespace system
++namespace graphics {
++namespace vulkan {
++
++// POD mirror of VulkanCommandProcessor::WosNativeDrawSnapshot, fixed 4-set array.
++struct WosNativeSnapshot {
++  bool valid;
++  VkPipeline pipeline;
++  VkPipelineLayout pipeline_layout;
++  VkDescriptorSet descriptor_sets[4];
++  uint32_t descriptor_set_count;
++  uint32_t host_vertex_count;
++  uint64_t vertex_shader_hash;
++  uint64_t pixel_shader_hash;
++  VkRenderPass render_pass;
++  VkFramebuffer framebuffer;
++  uint32_t fb_width;
++  uint32_t fb_height;
++};
++
++// Copies the current-draw snapshot out of the graphics system's command processor.
++// Returns false if the graphics system / command processor is not a Vulkan one or
++// not up yet (out is left zeroed). Safe to call from the title (game) thread.
++bool WosNativeGetDrawSnapshot(system::IGraphicsSystem* graphics_system,
++                              WosNativeSnapshot* out);
++
++}  // namespace vulkan
++}  // namespace graphics
++}  // namespace rex
++
++#endif  // REX_GRAPHICS_VULKAN_WOS_NATIVE_SNAPSHOT_H_
+diff --git a/include/rex/graphics/wos_probe_clock.h b/include/rex/graphics/wos_probe_clock.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..39ba06f9ba7ec8587f91089ade5baba374b5c7df
+--- /dev/null
++++ b/include/rex/graphics/wos_probe_clock.h
+@@ -0,0 +1,42 @@
++// WebOfShadowsRecomp (wos/patches/rexglue/0013): the probes' clock. The TSC,
++// read directly (a few ns) instead of through steady_clock (clock_gettime and
++// chrono, which the profile showed at 5% of the GPU command processor's time),
++// scaled to nanoseconds by a factor measured once against steady_clock.
++#pragma once
++
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <thread>
++
++#include <x86intrin.h>
++
++namespace rex::graphics::wos_probe {
++// WebOfShadowsRecomp (0028): the diagnostics master switch. Off by default, so a
++// release build pays nothing for the per-draw timing probes, the command
++// processor's idle/exec timing, or the title's per-frame perf log. The title
++// sets it from wos_recomp.toml (wos_diagnostics) before the game starts. Read
++// relaxed on the hot path - a predictable not-taken branch, no rdtsc and no
++// atomic add, when off.
++inline std::atomic<bool>& Enabled() {
++  static std::atomic<bool> enabled{false};
++  return enabled;
++}
++inline bool IsEnabled() { return Enabled().load(std::memory_order_relaxed); }
++
++inline double NsPerTick() {
++  static const double ns_per_tick = [] {
++    const auto c0 = std::chrono::steady_clock::now();
++    const uint64_t t0 = __rdtsc();
++    std::this_thread::sleep_for(std::chrono::milliseconds(20));
++    const auto c1 = std::chrono::steady_clock::now();
++    const uint64_t t1 = __rdtsc();
++    const double ns = double(std::chrono::duration_cast<std::chrono::nanoseconds>(c1 - c0).count());
++    return t1 > t0 ? ns / double(t1 - t0) : 1.0;
++  }();
++  return ns_per_tick;
++}
++inline uint64_t NowNs() {
++  return uint64_t(double(__rdtsc()) * NsPerTick());
++}
++}  // namespace rex::graphics::wos_probe
+diff --git a/include/rex/system/mmio_handler.h b/include/rex/system/mmio_handler.h
+index 7ae42a8996c11a86529946cadc4c5ecfb150fe60..0ada7211621cbd0d8c238b9278a30f0b97426347 100644
+--- a/include/rex/system/mmio_handler.h
++++ b/include/rex/system/mmio_handler.h
+@@ -74,6 +74,7 @@ class MMIOHandler {
+ 
+   static bool ExceptionCallbackThunk(arch::Exception* ex, void* data);
+   bool ExceptionCallback(arch::Exception* ex);
++  bool ExceptionCallbackImpl(arch::Exception* ex);  // WebOfShadowsRecomp 0004
+ 
+   uint8_t* virtual_membase_;
+   uint8_t* physical_membase_;
+diff --git a/include/rex/ui/overlay/achievement_notification.h b/include/rex/ui/overlay/achievement_notification.h
+index f9921edb6999ed703f5678d002b6684a2e735ee7..d59e0eb4b2580240c04445950fafa2a32f3d1ce2 100644
+--- a/include/rex/ui/overlay/achievement_notification.h
++++ b/include/rex/ui/overlay/achievement_notification.h
+@@ -22,6 +22,10 @@ class AchievementNotificationDialog : public ImGuiDialog {
+   // Thread-safe implementations may receive events from guest threads.
+   virtual void Push(const rex::system::AchievementEvent& event) = 0;
+ 
++  // WebOfShadowsRecomp (0022): from the UI thread after a Push - a dialog that
++  // leaves the UI drawers while it has nothing to show joins them again
++  virtual void ShowPendingFromUIThread() {}
++
+  protected:
+   explicit AchievementNotificationDialog(ImGuiDrawer* drawer) : ImGuiDialog(drawer) {}
+ };
+diff --git a/include/rex/ui/overlay/achievement_toast.h b/include/rex/ui/overlay/achievement_toast.h
+index 7642601727a36d2dcc502f14eae73d5a9da338ee..5c47a05c9cb282523fed4899c4c3b95bd1e9d725 100644
+--- a/include/rex/ui/overlay/achievement_toast.h
++++ b/include/rex/ui/overlay/achievement_toast.h
+@@ -34,6 +34,7 @@ class AchievementToastDialog : public AchievementNotificationDialog {
+ 
+   // Thread-safe: safe to call from any thread, including guest threads.
+   void Push(const rex::system::AchievementEvent& event) override;
++  void ShowPendingFromUIThread() override;
+ 
+  protected:
+   void OnDraw(ImGuiIO& io) override;
+diff --git a/src/core/memory_ps5.cpp b/src/core/memory_ps5.cpp
+index f7a0b8ba350c282817f096b0bd724be7d08fa751..237bd04c7c86c5d959d6a9f347d1033f3896a3eb 100644
+--- a/src/core/memory_ps5.cpp
++++ b/src/core/memory_ps5.cpp
+@@ -37,6 +37,8 @@
+ #if REX_PLATFORM_PS5
+ 
+ #include <algorithm>
++#include <atomic>
++#include <chrono>
+ #include <cstdint>
+ #include <memory>
+ #include <mutex>
+@@ -78,6 +80,21 @@ struct View {
+   void set_access(uintptr_t begin, uintptr_t end, PageAccess value) {
+     std::fill(access.begin() + page_index(begin), access.begin() + page_index(end - 1) + 1, value);
+   }
++  // WebOfShadowsRecomp (0027): every page in [begin, end) already has `value`,
++  // as this file last set it. The access vector is authoritative because every
++  // protection change (including fault handling) goes through ProtectViewRange,
++  // which records it here - so a true result means the mprotect syscall would be
++  // a no-op and can be skipped.
++  bool access_is(uintptr_t begin, uintptr_t end, PageAccess value) const {
++    const size_t first = page_index(begin);
++    const size_t last = page_index(end - 1);
++    for (size_t i = first; i <= last; ++i) {
++      if (access[i] != value) {
++        return false;
++      }
++    }
++    return true;
++  }
+ };
+ 
+ struct Mapping {
+@@ -284,7 +301,10 @@ bool ProtectViewRange(uintptr_t address, uintptr_t end, PageAccess access) {
+       const size_t file_at = view.file_offset + (at - view.base);
+       const size_t chunk = file_at / kChunk;
+       const uintptr_t next = std::min<uintptr_t>(stop, at + ((chunk + 1) * kChunk - file_at));
+-      if (mapping.chunks[chunk].bytes) {
++      if (mapping.chunks[chunk].bytes && !view.access_is(at, next, access)) {
++        // 0027: skipped when the pages already have this access - the shared
++        // memory write tracking re-protects pages that are often already in the
++        // requested state, and each sceKernelMprotect is a syscall.
+         const int32_t result = sceKernelMprotect(reinterpret_cast<void*>(at), size_t(next - at),
+                                                  KernelProtection(access));
+         if (result != 0) {
+@@ -415,7 +435,21 @@ bool DeallocFixed(void* base_address, size_t length, DeallocationType deallocati
+   return ps5_vrange_decommit(base_address, length) == 0;
+ }
+ 
++// WebOfShadowsRecomp (wos/patches/rexglue/0004): protection changes, counted and timed
++std::atomic<uint64_t> g_wos_protect_calls{0}, g_wos_protect_ns{0};
++static bool ProtectImpl(void* base_address, size_t length, PageAccess access,
++                        PageAccess* out_old_access);
+ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* out_old_access) {
++  const auto start = std::chrono::steady_clock::now();
++  const bool result = ProtectImpl(base_address, length, access, out_old_access);
++  g_wos_protect_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                   std::chrono::steady_clock::now() - start)
++                                   .count());
++  ++g_wos_protect_calls;
++  return result;
++}
++static bool ProtectImpl(void* base_address, size_t length, PageAccess access,
++                        PageAccess* out_old_access) {
+   if (out_old_access) {
+     size_t old_length = 0;
+     if (!QueryProtect(base_address, old_length, *out_old_access)) {
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index 19b0e632efd9c0bfe690b5edd628554bbb1ed8f9..e34d3141baa0d4344c69d9bf4390b97311306252 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -1392,8 +1392,19 @@ class PosixEvent : public PosixConditionHandle<Event> {
+   void Pulse() override {
+     using namespace std::chrono_literals;
+     handle_.Signal();
++#if REX_PLATFORM_PS5
++    // WebOfShadowsRecomp (wos/patches/rexglue/0007): a 10 us sleep is far longer
++    // on the console, and Web of Shadows' job queue pulses events thousands of
++    // times a second from its main thread (a quarter of that thread's time was
++    // in NtPulseEvent). Give the waiters the same 10 us by yielding instead.
++    const auto until = std::chrono::steady_clock::now() + 10us;
++    do {
++      MaybeYield();
++    } while (std::chrono::steady_clock::now() < until);
++#else
+     MaybeYield();
+     Sleep(10us);
++#endif
+     handle_.Reset();
+   }
+ };
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index b9a1302a6f524a8c43137caa712788e351340bc7..29458ea87b88e6a883b7d52256b48e967e3afeab 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -80,6 +80,74 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
+                     "pipelines are being prepared.")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++// WebOfShadowsRecomp for the PS5 (wos/patches/rexglue/0002): where the command
++// processor's time goes, for the title's frames-a-second line. Nanoseconds since
++// the last rex_gpu_perf_take: waiting for the guest's commands, executing them,
++// and (within executing) blocked on a GPU fence; and the blocking waits.
++#include <atomic>
++#include <chrono>
++#include <rex/graphics/wos_probe_clock.h>
++namespace rex::graphics::perf_probe {
++std::atomic<uint64_t> cp_idle_ns{0}, cp_exec_ns{0}, fence_wait_ns{0}, fence_waits{0},
++    occlusion_syncs{0};
++// 0003: within executing, the time in draws, resolves (copies), swaps (the
++// presenter) and ending submissions (vkQueueSubmit); and the draws
++std::atomic<uint64_t> draw_ns{0}, copy_ns{0}, swap_ns{0}, submit_ns{0}, draws{0};
++// 0004: steps of a draw: primitive processing, textures, render targets,
++// pipeline, bindings, vertex buffer ranges
++std::atomic<uint64_t> d_prim_ns{0}, d_tex_ns{0}, d_rt_ns{0}, d_pipe_ns{0}, d_bind_ns{0},
++    d_vtx_ns{0};
++// 0012: draws whose texture descriptor sets were reused / written
++std::atomic<uint64_t> tex_bind_hits{0}, tex_bind_misses{0};
++// 0019: what a long frame did, read cumulatively by the title's hitch log:
++// pipelines made on the command processor (new ones, or async placeholders),
++// the time in that, the time translating shaders, textures loaded and the time
++// loading them
++std::atomic<uint64_t> hitch_pipelines{0}, hitch_pipeline_ns{0}, hitch_translate_ns{0},
++    hitch_texture_loads{0}, hitch_texture_ns{0};
++inline uint64_t now_ns() { return ::rex::graphics::wos_probe::NowNs(); }
++}  // namespace rex::graphics::perf_probe
++// WebOfShadowsRecomp (0028): the title sets the diagnostics master switch from
++// wos_recomp.toml before the game starts.
++extern "C" void rex_gpu_set_diagnostics(bool enabled) {
++  ::rex::graphics::wos_probe::Enabled().store(enabled, std::memory_order_relaxed);
++}
++extern "C" void rex_gpu_hitch_read(uint64_t* out) {
++  using namespace rex::graphics::perf_probe;
++  out[0] = hitch_pipelines.load(std::memory_order_relaxed);
++  out[1] = hitch_pipeline_ns.load(std::memory_order_relaxed);
++  out[2] = hitch_translate_ns.load(std::memory_order_relaxed);
++  out[3] = hitch_texture_loads.load(std::memory_order_relaxed);
++  out[4] = hitch_texture_ns.load(std::memory_order_relaxed);
++}
++extern "C" void rex_gpu_perf_take(uint64_t* out) {
++  using namespace rex::graphics::perf_probe;
++  out[0] = cp_idle_ns.exchange(0);
++  out[1] = cp_exec_ns.exchange(0);
++  out[2] = fence_wait_ns.exchange(0);
++  out[3] = fence_waits.exchange(0);
++  out[4] = occlusion_syncs.exchange(0);
++}
++extern "C" void rex_gpu_perf_take2(uint64_t* out) {
++  using namespace rex::graphics::perf_probe;
++  out[0] = draw_ns.exchange(0);
++  out[1] = copy_ns.exchange(0);
++  out[2] = swap_ns.exchange(0);
++  out[3] = submit_ns.exchange(0);
++  out[4] = draws.exchange(0);
++}
++extern "C" void rex_gpu_perf_take3(uint64_t* out) {
++  using namespace rex::graphics::perf_probe;
++  out[0] = d_prim_ns.exchange(0);
++  out[1] = d_tex_ns.exchange(0);
++  out[2] = d_rt_ns.exchange(0);
++  out[3] = d_pipe_ns.exchange(0);
++  out[4] = d_bind_ns.exchange(0);
++  out[5] = d_vtx_ns.exchange(0);
++  out[6] = tex_bind_hits.exchange(0);
++  out[7] = tex_bind_misses.exchange(0);
++}
++
+ namespace rex::graphics {
+ 
+ using namespace rex::graphics::xenos;
+@@ -186,8 +254,12 @@ ReadbackResolveMode CommandProcessor::GetReadbackResolveMode(
+ }
+ 
+ bool CommandProcessor::IsReadbackMemexportEnabled(bool legacy_backend_flag) const {
+-  if (legacy_readback_memexport_cvar_name_ &&
+-      rex::cvar::HasNonDefaultValue(legacy_readback_memexport_cvar_name_)) {
++  // WebOfShadowsRecomp (0013): whether the legacy cvar was set, looked up once
++  // (by name, under the registry's lock, with a string made - on every draw it
++  // was 3% of the command processor's time); the settings don't change in play
++  static const bool legacy_set = legacy_readback_memexport_cvar_name_ &&
++                                 rex::cvar::HasNonDefaultValue(legacy_readback_memexport_cvar_name_);
++  if (legacy_set) {
+     return legacy_backend_flag;
+   }
+   return REXCVAR_GET(readback_memexport);
+@@ -220,6 +292,8 @@ void CommandProcessor::WorkerThreadMain() {
+       // We've run out of commands to execute.
+       // We spin here waiting for new ones, as the overhead of waiting on our
+       // event is too high.
++      const bool wos_diag = wos_probe::IsEnabled();  // 0028
++      const uint64_t idle_start = wos_diag ? perf_probe::now_ns() : 0;
+       PrepareForWait();
+       uint32_t loop_count = 0;
+       do {
+@@ -236,6 +310,9 @@ void CommandProcessor::WorkerThreadMain() {
+       } while (worker_running_ && pending_fns_.empty() &&
+                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
+       ReturnFromWait();
++      if (wos_diag) {
++        perf_probe::cp_idle_ns += perf_probe::now_ns() - idle_start;
++      }
+       if (!worker_running_ || !pending_fns_.empty()) {
+         continue;
+       }
+@@ -243,7 +320,12 @@ void CommandProcessor::WorkerThreadMain() {
+     assert_true(read_ptr_index_ != write_ptr_index);
+ 
+     // Execute. Note that we handle wraparound transparently.
++    const bool wos_diag_exec = wos_probe::IsEnabled();  // 0028
++    const uint64_t exec_start = wos_diag_exec ? perf_probe::now_ns() : 0;
+     read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
++    if (wos_diag_exec) {
++      perf_probe::cp_exec_ns += perf_probe::now_ns() - exec_start;
++    }
+ 
+     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
+     //     that many indices.
+@@ -1047,7 +1129,11 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+           // User wants it fast and dangerous.
+           rex::thread::MaybeYield();
+         } else {
+-          rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
++          // WebOfShadowsRecomp (0013): poll every 100 us instead of sleeping the
++          // packet's wait (a millisecond or more) - the condition is usually met
++          // well within it, and the rest of the sleep held the frame
++          rex::thread::Sleep(std::min(std::chrono::microseconds(100),
++                                      std::chrono::microseconds(1000 * (wait / 0x100))));
+         }
+         rex::thread::SyncMemory();
+         ReturnFromWait();
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index 8f2fcb0b69b1359f80b02c304c1fe06e0c092552..244d4d2f5ebf11a2c0fb6d4a3e5bf374231b8366 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -12,6 +12,7 @@
+ #include <rex/graphics/graphics_system.h>
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cctype>
+ #include <cstdint>
+ #include <functional>
+@@ -72,6 +73,19 @@ __declspec(dllexport) uint32_t AmdPowerXpressRequestHighPerformance = 1;
+ }  // extern "C"
+ #endif  // REX_PLATFORM_WIN32
+ 
++// WebOfShadowsRecomp (0023): a host display's vblank count for the guest vblank
++// to follow instead of its own timer, so the guest's frames keep one phase with
++// the display's refreshes (a timer at the guest's rate drifts against the
++// display's, and frames landing on either side of a refresh show for one or
++// three). Set by the title once it can read the display; 0 from it while it
++// cannot. The timer takes over when the count stops.
++namespace {
++std::atomic<uint64_t (*)()> g_host_vblank_counter{nullptr};
++}  // namespace
++extern "C" void rex_gpu_set_host_vblank_counter(uint64_t (*counter)()) {
++  g_host_vblank_counter.store(counter, std::memory_order_release);
++}
++
+ GraphicsSystem::GraphicsSystem() : vsync_worker_running_(false) {}
+ 
+ GraphicsSystem::~GraphicsSystem() = default;
+@@ -158,10 +172,44 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
+         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
+         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
++        // 0023: following the host's vblank count
++        bool host_following = false;
++        uint64_t host_last = 0, host_changed_at = 0;
+         while (vsync_worker_running_) {
+           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+           uint64_t interval_ticks =
+               REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
++          uint64_t (*const host_counter)() =
++              REXCVAR_GET(vsync) ? g_host_vblank_counter.load(std::memory_order_acquire)
++                                 : nullptr;
++          const uint64_t host_count = host_counter ? host_counter() : 0;
++          if (host_count) {
++            if (!host_following || host_count < host_last) {
++              if (!host_following) {
++                REXGPU_INFO("GPU: the guest vblank follows the display's");
++              }
++              host_following = true;
++              host_last = host_count;
++              host_changed_at = current_time;
++            } else if (host_count != host_last) {
++              // A burst after a stall is one vblank, not a catch-up
++              const uint64_t passed = host_count - host_last;
++              for (uint64_t i = 0; i < (passed > 3 ? 1 : passed); ++i) {
++                MarkVblank();
++              }
++              host_last = host_count;
++              host_changed_at = current_time;
++              last_frame_time = current_time;
++            }
++            if (current_time - host_changed_at < 3 * interval_ticks) {
++              rex::thread::Sleep(std::chrono::microseconds(500));
++              continue;
++            }
++            // Stopped for three intervals: the timer until it moves again
++          } else if (host_following) {
++            host_following = false;
++            last_frame_time = current_time;
++          }
+           while (current_time - last_frame_time >= interval_ticks) {
+             MarkVblank();
+             last_frame_time += interval_ticks;
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+index 76f5600cf7b950b0469cf926ecd76ff578e80f24..48cf1ddbec7c47ab1a27b59ad4dd2441d3e8ba8e 100644
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <cstdint>
++#include <cstring>
+ #include <utility>
+ 
+ #include <rex/assert.h>
+@@ -125,6 +126,11 @@ REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
+ //     "96 MB, and with 3x3, it will be 360 + 216 MB.",
+ //     "GPU");
+ 
++#include <atomic>
++#include <rex/graphics/wos_probe_clock.h>
++namespace rex::graphics::perf_probe {  // src/graphics/command_processor.cpp
++extern std::atomic<uint64_t> hitch_texture_loads, hitch_texture_ns;
++}
+ namespace rex::graphics {
+ 
+ const TextureCache::LoadShaderInfo TextureCache::load_shader_info_[kLoadShaderCount] = {
+@@ -340,7 +346,12 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_
+         add_bits &= (UINT32_C(1) << ((page_last & 31) + 1)) - 1;
+       }
+       scaled_resolve_pages_[i] |= add_bits;
+-      scaled_resolve_pages_l2_[i >> 6] |= UINT64_C(1) << (i & 63);
++      uint64_t& l2 = scaled_resolve_pages_l2_[i >> 6];
++      const uint64_t l2_bit = UINT64_C(1) << (i & 63);
++      if (!(l2 & l2_bit)) {
++        l2 |= l2_bit;
++        wos_scaled_resolve_l2_set_count_.fetch_add(1, std::memory_order_relaxed);  // 0026
++      }
+     }
+   }
+ 
+@@ -366,6 +377,142 @@ uint32_t TextureCache::GuestToHostSwizzle(uint32_t guest_swizzle, uint32_t host_
+   return host_swizzle;
+ }
+ 
++// WebOfShadowsRecomp (wos/patches/rexglue/0008): texture dumps and replacements.
++//
++// Each texture the GPU loads is fingerprinted with XXH3 over its guest data (the
++// base level and, when it has them, its mips, as the guest stores them: tiled and
++// big-endian). With wos_texture_dump on, the data of every fingerprint not yet
++// dumped is written to <title>/mods/dump/ with the format in its name; a file
++// <fingerprint>.bin of the same size in <title>/mods/textures/ is copied over the
++// guest's data before the load, so the GPU loads that instead (wos/tools/
++// wos_textures.py converts between those files and PNG).
++}  // namespace rex::graphics
++REXCVAR_DEFINE_BOOL(wos_texture_dump, false, "GPU",
++                    "Write every texture the game loads to <title>/mods/dump");
++#include <cstdio>
++#include <mutex>
++#include <string>
++#include <unordered_set>
++#include <vector>
++#include <dirent.h>
++#include <sys/stat.h>
++#include <rex/hash.h>
++#include <rex/system/kernel_state.h>
++#if REX_PLATFORM_PS5
++extern "C" const char* prospero_state_root();
++#endif
++namespace rex::graphics {
++namespace {
++std::string WosModsRoot() {
++#if REX_PLATFORM_PS5
++  return std::string(prospero_state_root()) + "/mods";
++#else
++  return "mods";
++#endif
++}
++struct WosTextureMods {
++  std::once_flag scanned;
++  std::unordered_set<uint64_t> replacements;
++  // 0020: the replacements' sizes - only a texture of one of them is hashed
++  std::unordered_set<uint32_t> replacement_sizes;
++  std::unordered_set<uint64_t> dumped;
++  std::mutex lock;
++};
++WosTextureMods& WosMods() {
++  static WosTextureMods mods;
++  std::call_once(mods.scanned, [] {
++    const std::string dir = WosModsRoot() + "/textures";
++    if (DIR* d = opendir(dir.c_str())) {
++      while (dirent* entry = readdir(d)) {
++        uint64_t hash = 0;
++        char tail[8] = {};
++        if (std::sscanf(entry->d_name, "%16llx%7s", reinterpret_cast<unsigned long long*>(&hash),
++                        tail) == 2 &&
++            std::string(tail) == ".bin") {
++          struct stat st;
++          if (stat((dir + "/" + entry->d_name).c_str(), &st) == 0 && st.st_size > 0) {
++            mods.replacements.insert(hash);
++            mods.replacement_sizes.insert(uint32_t(st.st_size));
++          }
++        }
++      }
++      closedir(d);
++    }
++    REXGPU_INFO("Texture mods: {} replacement(s) in {}", mods.replacements.size(), dir);
++  });
++  return mods;
++}
++// Returns the bytes replaced from the base address (0 when nothing was replaced)
++template <typename Key>
++uint32_t WosTextureModsForLoad(memory::Memory& memory, const Key& key, uint32_t base_size,
++                               uint32_t mips_size) {
++  WosTextureMods& mods = WosMods();
++  const bool dump = REXCVAR_GET(wos_texture_dump);
++  if (!dump && mods.replacements.empty()) {
++    return 0;
++  }
++  if (!key.base_page || !base_size) {
++    return 0;
++  }
++  // The base level, and the mips that follow it in the same allocation when the
++  // texture keeps them there (packed or contiguous); mips elsewhere are left
++  const uint32_t base_address = key.base_page << 12;
++  uint32_t size = base_size;
++  if (key.mip_page && (key.mip_page << 12) == base_address + base_size) {
++    size += mips_size;
++  }
++  if (!dump && !mods.replacement_sizes.count(size)) {
++    return 0;
++  }
++  uint8_t* data = memory.TranslatePhysical(base_address);
++  if (!data) {
++    return 0;
++  }
++  const uint64_t hash = XXH3_64bits(data, size);
++  if (mods.replacements.count(hash)) {
++    const std::string path = WosModsRoot() + "/textures/" + fmt::format("{:016x}.bin", hash);
++    if (FILE* f = std::fopen(path.c_str(), "rb")) {
++      std::vector<uint8_t> replacement(size);
++      const size_t read = std::fread(replacement.data(), 1, size + 1, f);
++      std::fclose(f);
++      if (read == size) {
++        std::memcpy(data, replacement.data(), size);
++        REXGPU_INFO("Texture mods: replaced {:016x} ({}x{} format {})", hash, key.GetWidth(),
++                    key.GetHeight(), uint32_t(key.format));
++        return size;
++      } else {
++        REXGPU_WARN("Texture mods: {} is {} bytes, the texture {}: not used", path, read, size);
++      }
++    }
++    return 0;
++  }
++  if (!dump) {
++    return 0;
++  }
++  {
++    std::lock_guard lock(mods.lock);
++    if (!mods.dumped.insert(hash).second) {
++      return 0;
++    }
++  }
++  const std::string dir = WosModsRoot() + "/dump";
++  mkdir(WosModsRoot().c_str(), 0777);
++  mkdir(dir.c_str(), 0777);
++  // <hash>_f<format>_<width>x<height>_<t|l>_e<endian>_p<pitch>_m<mip levels>_<bytes>.bin
++  const std::string path = dir + fmt::format("/{:016x}_f{}_{}x{}_{}_e{}_p{}_m{}_{}.bin", hash,
++                                             uint32_t(key.format), key.GetWidth(), key.GetHeight(),
++                                             key.tiled ? "t" : "l", uint32_t(key.endianness),
++                                             uint32_t(key.pitch), uint32_t(key.mip_max_level) + 1,
++                                             size);
++  if (FILE* f = std::fopen(path.c_str(), "wb")) {
++    std::fwrite(data, 1, size, f);
++    std::fclose(f);
++    chmod(path.c_str(), 0666);
++  }
++  return 0;
++}
++}  // namespace
++
+ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pending_load_out,
+                                       PendingSharedMemoryRange* pending_ranges_out,
+                                       size_t& pending_range_count_out) {
+@@ -388,6 +535,21 @@ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pend
+   if (!base_outdated && !mips_outdated) {
+     return false;
+   }
++  if (base_outdated && texture.key().dimension == xenos::DataDimension::k2DOrStacked &&
++      texture.key().GetDepthOrArraySize() == 1 && !texture.key().scaled_resolve) {
++    const uint32_t replaced = WosTextureModsForLoad(*REX_KERNEL_MEMORY(), texture.key(),
++                                                    texture.GetGuestBaseSize(),
++                                                    texture.GetGuestMipsSize());
++    if (replaced) {
++      // The replacement went into guest memory behind the shared memory's back:
++      // its GPU copy of those pages may be valid already (with the original
++      // data), so mark them modified, and load the base and the mips from it
++      shared_memory().MemoryInvalidationCallback(texture.key().base_page << 12, replaced, true);
++      if (replaced > texture.GetGuestBaseSize()) {
++        mips_outdated = true;
++      }
++    }
++  }
+ 
+   pending_load_out.texture = &texture;
+   pending_load_out.load_base = base_outdated;
+@@ -435,9 +597,17 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
+     }
+   }
+ 
+-  if (!LoadTextureDataFromResidentMemoryImpl(texture, pending_load.load_base,
+-                                             pending_load.load_mips)) {
+-    return false;
++  {
++    // WebOfShadowsRecomp (0019): counted and timed for the title's hitch log
++    const uint64_t wos_start = ::rex::graphics::wos_probe::NowNs();
++    const bool loaded = LoadTextureDataFromResidentMemoryImpl(texture, pending_load.load_base,
++                                                              pending_load.load_mips);
++    ::rex::graphics::perf_probe::hitch_texture_loads.fetch_add(1, std::memory_order_relaxed);
++    ::rex::graphics::perf_probe::hitch_texture_ns.fetch_add(
++        ::rex::graphics::wos_probe::NowNs() - wos_start, std::memory_order_relaxed);
++    if (!loaded) {
++      return false;
++    }
+   }
+ 
+   // Mark the ranges as uploaded and watch them. This is needed for scaled
+@@ -763,7 +933,11 @@ void TextureCache::DestroyAllTextures(bool from_destructor) {
+ 
+ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
+   // Check if the texture is a scaled resolve texture.
+-  if (IsDrawResolutionScaled() && key.tiled && IsScaledResolveSupportedForFormat(key)) {
++  // WebOfShadowsRecomp (0026): the GetGuestLayout + range scans below are skipped
++  // entirely when nothing is scaled-resolved (the usual case) - the count read is
++  // relaxed, and IsRangeScaledResolved re-checks authoritatively under the lock.
++  if (IsDrawResolutionScaled() && key.tiled && IsScaledResolveSupportedForFormat(key) &&
++      wos_scaled_resolve_l2_set_count_.load(std::memory_order_relaxed)) {
+     texture_util::TextureGuestLayout scaled_resolve_guest_layout = key.GetGuestLayout();
+     if ((scaled_resolve_guest_layout.base.level_data_extent_bytes &&
+          IsRangeScaledResolved(key.base_page << 12,
+@@ -880,6 +1054,7 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
+   return texture;
+ }
+ 
++
+ bool TextureCache::LoadTextureData(Texture& texture) {
+   PendingTextureLoad pending_load;
+   PendingSharedMemoryRange pending_ranges[2];
+@@ -1018,6 +1193,10 @@ bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t lengt
+   if (!IsDrawResolutionScaled()) {
+     return false;
+   }
++  // WebOfShadowsRecomp (0026): nothing scaled-resolved anywhere - skip the lock.
++  if (!wos_scaled_resolve_l2_set_count_.load(std::memory_order_relaxed)) {
++    return false;
++  }
+ 
+   start_unscaled = std::min(start_unscaled, SharedMemory::kBufferSize);
+   length_unscaled = std::min(length_unscaled, SharedMemory::kBufferSize - start_unscaled);
+@@ -1112,6 +1291,7 @@ void TextureCache::ScaledResolveGlobalWatchCallback(
+       scaled_resolve_pages_[resolve_block_index] &= resolve_keep_bits;
+       if (scaled_resolve_pages_[resolve_block_index] == 0) {
+         scaled_resolve_pages_l2_[i] &= ~(UINT64_C(1) << resolve_block_relative_index);
++        wos_scaled_resolve_l2_set_count_.fetch_sub(1, std::memory_order_relaxed);  // 0026
+       }
+     }
+   }
+diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
+index ec0df7c81818347935dd79f03787f7a3142dac17..a18cb0209edb5120d9e2bc754dbcadf7352add13 100644
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -9,6 +9,8 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <atomic>
++#include <chrono>
+ #include <algorithm>
+ #include <cstring>
+ #include <utility>
+@@ -337,11 +339,65 @@ void SharedMemory::UnlinkWatchRange(WatchRange* range) {
+   watch_range_first_free_ = range;
+ }
+ 
++// WebOfShadowsRecomp (wos/patches/rexglue/0005): shared memory requests, timed:
++// calls, all the time in them, the time waiting for the global lock, uploads
++}  // namespace rex::graphics
++#include <rex/graphics/wos_probe_clock.h>
++namespace rex::graphics {
++namespace perf_probe_sm {
++std::atomic<uint64_t> calls{0}, total_ns{0}, lock_ns{0}, upload_ns{0};
++inline uint64_t now_ns() { return ::rex::graphics::wos_probe::NowNs(); }
++}  // namespace perf_probe_sm
+ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count) {
++  struct ProbeScope {
++    uint64_t start = perf_probe_sm::now_ns();
++    ~ProbeScope() { perf_probe_sm::total_ns += perf_probe_sm::now_ns() - start; }
++  } probe_scope;
++  ++perf_probe_sm::calls;
+   if (ranges == nullptr || !count) {
+     return true;
+   }
+ 
++  // WebOfShadowsRecomp (wos/patches/rexglue/0006): most requests are for pages
++  // already in sync. Check that without the global critical region, which the
++  // guest's kernel calls hold constantly (on the PS5 the command processor
++  // waited for it for a quarter to a third of its time), and without
++  // allocating. A page invalidated during the check is caught by the next
++  // request, as a CPU write racing the GPU's read would be on the console.
++  {
++    bool all_valid = true;
++    for (size_t i = 0; i < count && all_valid; ++i) {
++      const uint32_t start = ranges[i].first;
++      const uint32_t length = ranges[i].second;
++      if (!length) {
++        continue;
++      }
++      if (start > kBufferSize || (kBufferSize - start) < length) {
++        all_valid = false;
++        break;
++      }
++      const uint32_t page_first = start >> page_size_log2_;
++      const uint32_t page_last = (start + length - 1) >> page_size_log2_;
++      for (uint32_t block = page_first >> 6; block <= (page_last >> 6); ++block) {
++        uint64_t mask = ~uint64_t(0);
++        if (block == (page_first >> 6)) {
++          mask &= ~((uint64_t(1) << (page_first & 63)) - 1);
++        }
++        if (block == (page_last >> 6) && (page_last & 63) != 63) {
++          mask &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
++        }
++        const uint64_t valid = __atomic_load_n(&system_page_flags_valid_[block], __ATOMIC_ACQUIRE);
++        if ((valid & mask) != mask) {
++          all_valid = false;
++          break;
++        }
++      }
++    }
++    if (all_valid) {
++      return true;
++    }
++  }
++
+   // Some texture or buffer is empty, for example - safe to draw in this case.
+   std::vector<std::pair<uint32_t, uint32_t>> merged_ranges;
+   merged_ranges.reserve(count);
+@@ -404,7 +460,9 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+     upload_ranges_.emplace_back(page_start, page_count);
+   };
+   {
++    const uint64_t probe_lock_start = perf_probe_sm::now_ns();
+     auto global_lock = global_critical_region_.Acquire();
++    perf_probe_sm::lock_ns += perf_probe_sm::now_ns() - probe_lock_start;
+     for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
+       uint32_t page_first = range.first >> page_size_log2_;
+       uint32_t page_last = (range.first + range.second - 1) >> page_size_log2_;
+@@ -465,7 +523,10 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+     return true;
+   }
+ 
+-  return UploadRanges(upload_ranges_);
++  const uint64_t probe_upload_start = perf_probe_sm::now_ns();
++  const bool uploaded = UploadRanges(upload_ranges_);
++  perf_probe_sm::upload_ns += perf_probe_sm::now_ns() - probe_upload_start;
++  return uploaded;
+ }
+ 
+ bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
+@@ -576,3 +637,11 @@ bool SharedMemory::EnsureHostGpuMemoryAllocated(uint32_t start, uint32_t length)
+ }
+ 
+ }  // namespace rex::graphics
++
++extern "C" void rex_sm_perf_take(uint64_t* out) {
++  using namespace rex::graphics::perf_probe_sm;
++  out[0] = calls.exchange(0);
++  out[1] = total_ns.exchange(0);
++  out[2] = lock_ns.exchange(0);
++  out[3] = upload_ns.exchange(0);
++}
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 0c996bd82499c624d81785ee27c624c55f5b7845..c3c2decb1ff1f74e3a1753b7a775ca95b93f994a 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -11,6 +11,11 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <bit>
++#include <condition_variable>
++#include <deque>
++#include <memory>
++#include <thread>
+ #include <cstdint>
+ #include <cstring>
+ #include <iterator>
+@@ -35,6 +40,8 @@
+ #include <rex/graphics/pipeline/shader/spirv_translator.h>
+ #include <rex/graphics/registers.h>
+ #include <rex/graphics/vulkan/command_processor.h>
++#include <rex/graphics/vulkan/graphics_system.h>      // GraphicsSystem cast (WoS native A2)
++#include <rex/graphics/vulkan/wos_native_snapshot.h>  // WosNativeGetDrawSnapshot (WoS native A2)
+ #include <rex/graphics/vulkan/pipeline_cache.h>
+ #include <rex/graphics/vulkan/render_target_cache.h>
+ #include <rex/graphics/vulkan/shader.h>
+@@ -47,6 +54,18 @@
+ #include <rex/ui/vulkan/presenter.h>
+ #include <rex/ui/vulkan/util.h>
+ 
++// WebOfShadowsRecomp native renderer A2 (patch 0030): when set, the FIRST
++// non-indexed guest draw whose state we snapshot is ALSO re-rendered natively, on
++// THIS command-processor thread, into our own offscreen image using the snapshot's
++// pipeline + descriptor sets, then read back and the rendered pixel count logged.
++// Running here (not the game thread) is essential: the descriptor sets are
++// per-submission transients valid only on this thread, and the queue submit
++// serializes via AcquireQueue with our own submits. Off by default; the title's
++// native toml turns it on. Proves rexglue's REAL translated shader renders through
++// a host pipeline we drive ourselves.
++REXCVAR_DEFINE_BOOL(wos_native_a2, false, "WoS",
++                    "Native renderer A2: re-render one guest draw with its real shader");
++
+ // Legacy backend compatibility aliases for shared readback controls.
+ REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
+                     "Read render-to-texture results on the CPU")
+@@ -64,14 +83,171 @@ REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
+ REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
+                     "Submit command buffer when PM4 primary buffer ends")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_BOOL(vulkan_async_submission, true, "GPU/Vulkan",
++                    "Record and submit the Vulkan command buffers of submissions other than "
++                    "swaps on a thread of their own (WebOfShadowsRecomp)");
+ 
+ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
+                     "Use VK_KHR_dynamic_rendering for Vulkan GPU emulation when supported by the "
+                     "device (falls back to render passes otherwise)")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++#include <atomic>
++#include <chrono>
++#include <rex/graphics/wos_probe_clock.h>
++namespace rex::graphics::perf_probe {  // src/graphics/command_processor.cpp
++extern std::atomic<uint64_t> fence_wait_ns, fence_waits, occlusion_syncs;
++extern std::atomic<uint64_t> draw_ns, copy_ns, swap_ns, submit_ns, draws;
++// 0004: steps of a draw
++extern std::atomic<uint64_t> d_prim_ns, d_tex_ns, d_rt_ns, d_pipe_ns, d_bind_ns, d_vtx_ns;
++extern std::atomic<uint64_t> tex_bind_hits, tex_bind_misses;
++extern std::atomic<uint64_t> hitch_translate_ns;
++struct ScopedNs {
++  // 0028: nothing when diagnostics are off (the usual case) - no rdtsc, no add.
++  std::atomic<uint64_t>* total;
++  uint64_t start;
++  explicit ScopedNs(std::atomic<uint64_t>& t)
++      : total(::rex::graphics::wos_probe::IsEnabled() ? &t : nullptr),
++        start(total ? ::rex::graphics::wos_probe::NowNs() : 0) {}
++  ~ScopedNs() {
++    if (total) {
++      total->fetch_add(::rex::graphics::wos_probe::NowNs() - start, std::memory_order_relaxed);
++    }
++  }
++};
++}  // namespace rex::graphics::perf_probe
++#define WOS_PROBE(counter, expr) \
++  ([&]() -> decltype(auto) { ::rex::graphics::perf_probe::ScopedNs wos_probe_scope{::rex::graphics::perf_probe::counter}; return (expr); }())
++
+ namespace rex::graphics::vulkan {
+ 
++// WebOfShadowsRecomp (wos/patches/rexglue/0011): recording a submission's
++// deferred commands into its Vulkan command buffer and submitting it (with
++// RADV on the PS5, the AGC submission alone took about a fifth of the command
++// processor's time) go to a thread of their own. Submissions stay in order;
++// swaps are submitted by the command processor after the ones before, so the
++// presenter's own submissions follow them; and a fence is waited for only once
++// its submission is made.
++struct WosAsyncSubmitter {
++  struct Job {
++    explicit Job(const VulkanCommandProcessor& command_processor) : stream(command_processor) {}
++    DeferredCommandBuffer stream;
++    VkCommandPool pool = VK_NULL_HANDLE;
++    VkCommandBuffer buffer = VK_NULL_HANDLE;
++    std::vector<VkSemaphore> wait_semaphores;
++    std::vector<VkPipelineStageFlags> wait_stage_masks;
++    VkFence fence = VK_NULL_HANDLE;
++  };
++
++  WosAsyncSubmitter(const VulkanCommandProcessor& command_processor)
++      : command_processor(command_processor) {
++    thread = std::thread([this] { Run(); });
++  }
++  ~WosAsyncSubmitter() {
++    {
++      std::lock_guard lock(mutex);
++      stop = true;
++    }
++    work_wanted.notify_all();
++    thread.join();
++  }
++
++  std::unique_ptr<Job> TakeJob() {
++    std::lock_guard lock(mutex);
++    if (free_jobs.empty()) {
++      return std::make_unique<Job>(command_processor);
++    }
++    std::unique_ptr<Job> job = std::move(free_jobs.back());
++    free_jobs.pop_back();
++    return job;
++  }
++
++  void Push(std::unique_ptr<Job> job) {
++    {
++      std::lock_guard lock(mutex);
++      jobs.push_back(std::move(job));
++    }
++    work_wanted.notify_one();
++  }
++
++  uint64_t Pending(bool drain) {
++    std::unique_lock lock(mutex);
++    if (drain) {
++      work_done.wait(lock, [this] { return jobs.empty() && !busy; });
++    }
++    return jobs.size() + (busy ? 1 : 0);
++  }
++
++  void Run() {
++    const ui::vulkan::VulkanDevice* const vulkan_device = command_processor.GetVulkanDevice();
++    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++    const VkDevice device = vulkan_device->device();
++    std::unique_lock lock(mutex);
++    for (;;) {
++      work_wanted.wait(lock, [this] { return stop || !jobs.empty(); });
++      if (jobs.empty()) {
++        return;
++      }
++      std::unique_ptr<Job> job = std::move(jobs.front());
++      jobs.pop_front();
++      busy = true;
++      lock.unlock();
++
++      VkResult result = dfn.vkResetCommandPool(device, job->pool, 0);
++      if (result == VK_SUCCESS) {
++        VkCommandBufferBeginInfo begin_info = {};
++        begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
++        begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++        result = dfn.vkBeginCommandBuffer(job->buffer, &begin_info);
++      }
++      if (result == VK_SUCCESS) {
++        job->stream.Execute(job->buffer);
++        result = dfn.vkEndCommandBuffer(job->buffer);
++      }
++      if (result == VK_SUCCESS) {
++        VkSubmitInfo submit_info = {};
++        submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
++        submit_info.waitSemaphoreCount = uint32_t(job->wait_semaphores.size());
++        submit_info.pWaitSemaphores =
++            job->wait_semaphores.empty() ? nullptr : job->wait_semaphores.data();
++        submit_info.pWaitDstStageMask =
++            job->wait_stage_masks.empty() ? nullptr : job->wait_stage_masks.data();
++        submit_info.commandBufferCount = 1;
++        submit_info.pCommandBuffers = &job->buffer;
++        ui::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
++            vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
++        result = dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, job->fence);
++      }
++      if (result != VK_SUCCESS) {
++        REXGPU_ERROR("Vulkan async submission failed: {}", int(result));
++        if (result == VK_ERROR_DEVICE_LOST) {
++          device_lost = true;
++        }
++      }
++      job->stream.Reset();
++      job->wait_semaphores.clear();
++      job->wait_stage_masks.clear();
++
++      lock.lock();
++      free_jobs.push_back(std::move(job));
++      busy = false;
++      work_done.notify_all();
++    }
++  }
++
++  const VulkanCommandProcessor& command_processor;
++  std::mutex mutex;
++  std::condition_variable work_wanted;
++  std::condition_variable work_done;
++  std::deque<std::unique_ptr<Job>> jobs;
++  std::vector<std::unique_ptr<Job>> free_jobs;
++  bool busy = false;
++  bool stop = false;
++  std::atomic<bool> device_lost{false};
++  std::thread thread;
++};
++
++
+ namespace {
+ 
+ // glslang default built-in resource limits.
+@@ -597,6 +773,20 @@ VulkanCommandProcessor::VulkanCommandProcessor(VulkanGraphicsSystem* graphics_sy
+   legacy_readback_memexport_cvar_name_ = "vulkan_readback_memexport";
+ }
+ 
++uint64_t VulkanCommandProcessor::WosAsyncSubmissionsPending(bool drain) {
++  if (!wos_async_submitter_) {
++    return 0;
++  }
++  const uint64_t pending = wos_async_submitter_->Pending(drain);
++  if (wos_async_submitter_->device_lost && !device_lost_) {
++    device_lost_ = true;
++    if (graphics_system_) {
++      graphics_system_->OnHostGpuLossFromAnyThread(true);
++    }
++  }
++  return pending;
++}
++
+ VulkanCommandProcessor::~VulkanCommandProcessor() = default;
+ 
+ void VulkanCommandProcessor::ClearCaches() {
+@@ -829,7 +1019,8 @@ bool VulkanCommandProcessor::SetupContext() {
+   for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
+     VkDescriptorSetLayoutBinding& constants_binding = descriptor_set_layout_bindings_constants[i];
+     constants_binding.binding = i;
+-    constants_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
++    // WebOfShadowsRecomp (0014): dynamic, offsets given when binding
++    constants_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+     constants_binding.descriptorCount = 1;
+     constants_binding.pImmutableSamplers = nullptr;
+   }
+@@ -1899,6 +2090,7 @@ bool VulkanCommandProcessor::SetupContext() {
+ 
+ void VulkanCommandProcessor::ShutdownContext() {
+   AwaitAllQueueOperationsCompletion();
++  wos_async_submitter_.reset();
+   InvalidateAllVertexBufferResidency();
+   ShutdownOcclusionQueryResources();
+ 
+@@ -2047,6 +2239,9 @@ void VulkanCommandProcessor::ShutdownContext() {
+     ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
+                                            descriptor_set_layout_single_transient);
+   }
++  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
++                                         wos_constants_pool_);
++  wos_constants_sets_.clear();
+   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
+                                          descriptor_set_layout_constants_);
+   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
+@@ -2125,6 +2320,31 @@ void VulkanCommandProcessor::ShutdownContext() {
+ }
+ 
+ void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
++  // WebOfShadowsRecomp (0025): shader constants and fetch constants all live at
++  // 0x4000 and above. A write below that (render state, the common type-0 case)
++  // needs none of the constant handling below, so take the base path directly
++  // and skip the range comparisons.
++  if (index < XE_GPU_REG_SHADER_CONSTANT_000_X) {
++    CommandProcessor::WriteRegister(index, value);
++    return;
++  }
++  // WebOfShadowsRecomp (0020): a constant rewritten with the value it already
++  // has leaves the constant buffers and the texture bindings as they are (the
++  // game sets its constants again for every draw). Vertex buffer residency is
++  // still reset, as before - that is what notices vertex data the CPU rewrote.
++  const bool wos_is_fetch = index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
++                            index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5;
++  const bool wos_is_constant =
++      wos_is_fetch ||
++      (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) ||
++      (index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
++       index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31);
++  if (wos_is_constant && register_file_->values[index] == value) {
++    if (wos_is_fetch) {
++      InvalidateVertexBufferResidency((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 2);
++    }
++    return;
++  }
+   CommandProcessor::WriteRegister(index, value);
+ 
+   if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
+@@ -2153,6 +2373,7 @@ void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+              index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) {
+     current_constant_buffers_up_to_date_ &=
+         ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFetch);
++    wos_samplers_valid_ = false;  // 0024
+     if (texture_cache_) {
+       texture_cache_->TextureFetchConstantWritten((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) /
+                                                   6);
+@@ -2194,9 +2415,35 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
+     return (usage_map[last_word] & last_mask) != 0;
+   };
+ 
++  // WebOfShadowsRecomp (0020): constants are compared with what the registers
++  // already hold, and only the part that changed invalidates anything (the game
++  // sets the same constants again for every draw). Returns false when nothing
++  // changed; start_index / end_index are narrowed to the changed registers.
++  auto wos_store_changed = [this, base](uint32_t& start_index, uint32_t& end_index) -> bool {
++    const uint32_t count = end_index - start_index + 1;
++    uint32_t* const regs = register_file_->values + start_index;
++    uint32_t first = 0;
++    while (first < count && regs[first] == rex::byte_swap(base[first])) {
++      ++first;
++    }
++    if (first == count) {
++      return false;
++    }
++    uint32_t last = count - 1;
++    while (last > first && regs[last] == rex::byte_swap(base[last])) {
++      --last;
++    }
++    memory::copy_and_swap(regs + first, base + first, last - first + 1);
++    end_index = start_index + last;
++    start_index += first;
++    return true;
++  };
++
+   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
+       end_index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
+-    memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
++    if (!wos_store_changed(start_index, end_index)) {
++      return;
++    }
+     if (frame_open_) {
+       uint32_t first_float_constant = (start_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
+       uint32_t last_float_constant = (end_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
+@@ -2224,7 +2471,9 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
+ 
+   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
+       end_index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
+-    memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
++    if (!wos_store_changed(start_index, end_index)) {
++      return;
++    }
+     current_constant_buffers_up_to_date_ &=
+         ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferBoolLoop);
+     return;
+@@ -2232,15 +2481,20 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
+ 
+   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
+       end_index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) {
+-    memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
++    // Vertex buffer residency for the whole range written, changed or not
++    InvalidateVertexBufferResidencyRange((start_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 2,
++                                         (end_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 2);
++    if (!wos_store_changed(start_index, end_index)) {
++      return;
++    }
+     current_constant_buffers_up_to_date_ &=
+         ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFetch);
++    wos_samplers_valid_ = false;  // 0024
+     uint32_t first_fetch_dword = start_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
+     uint32_t last_fetch_dword = end_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
+     if (texture_cache_) {
+       texture_cache_->TextureFetchConstantsWritten(first_fetch_dword / 6, last_fetch_dword / 6);
+     }
+-    InvalidateVertexBufferResidencyRange(first_fetch_dword / 2, last_fetch_dword / 2);
+     return;
+   }
+ 
+@@ -2272,6 +2526,7 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
+ 
+ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                                        uint32_t frontbuffer_height) {
++  perf_probe::ScopedNs probe_scope{perf_probe::swap_ns};
+   SCOPE_profile_cpu_f("gpu");
+   vertex_buffers_in_sync_[0] = 0;
+   vertex_buffers_in_sync_[1] = 0;
+@@ -3600,6 +3855,10 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
+ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
+                                        IndexBufferInfo* index_buffer_info,
+                                        bool major_mode_explicit) {
++  perf_probe::ScopedNs probe_scope{perf_probe::draw_ns};
++  if (wos_probe::IsEnabled()) {  // 0028
++    perf_probe::draws.fetch_add(1, std::memory_order_relaxed);
++  }
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+@@ -3718,7 +3977,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     }
+ 
+     // Process primitives.
+-    if (!primitive_processor_->Process(primitive_processing_result)) {
++    if (!WOS_PROBE(d_prim_ns, primitive_processor_->Process(primitive_processing_result))) {
+       return draw_fail("primitive_processing");
+     }
+     if (!primitive_processing_result.host_draw_vertex_count) {
+@@ -3763,8 +4022,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+         pixel_shader ? static_cast<VulkanShader::VulkanTranslation*>(
+                            pixel_shader->GetOrCreateTranslation(pixel_shader_modification.value))
+                      : nullptr;
+-    if (!pipeline_cache_->EnsureShadersTranslated(vertex_shader_translation,
+-                                                  pixel_shader_translation)) {
++    if (!WOS_PROBE(hitch_translate_ns,
++                   pipeline_cache_->EnsureShadersTranslated(vertex_shader_translation,
++                                                            pixel_shader_translation))) {
+       return draw_fail("shader_translation");
+     }
+ 
+@@ -3773,22 +4033,40 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     // different for some reason (like a race condition with the guest in index
+     // buffer processing in the primitive processor resulting in different host
+     // vertex shader types), the bindings will stay the same.
+-    // TODO(Triang3l): Sampler caching and reuse for adjacent draws within one
+-    // submission.
++    // WebOfShadowsRecomp (0024): the parameter lists are rebuilt from the fetch
++    // constants only when the shaders or the fetch constants changed since the
++    // last draw (the former TODO here). Consecutive draws usually share both, so
++    // this skips the per-binding GetSamplerParameters hashing. The VkSampler
++    // handles are still refreshed every draw (UseSampler, below). On the retry
++    // iteration (i != 0) the lists are kept as built on the first.
++    const int32_t wos_anisotropic_override = REXCVAR_GET(anisotropic_override);
++    bool wos_rebuild_samplers = !i;
++    if (!i) {
++      if (wos_samplers_valid_ && wos_samplers_vertex_shader_ == vertex_shader &&
++          wos_samplers_pixel_shader_ == pixel_shader &&
++          wos_samplers_anisotropic_override_ == wos_anisotropic_override) {
++        wos_rebuild_samplers = false;
++      } else {
++        wos_samplers_valid_ = true;
++        wos_samplers_vertex_shader_ = vertex_shader;
++        wos_samplers_pixel_shader_ = pixel_shader;
++        wos_samplers_anisotropic_override_ = wos_anisotropic_override;
++      }
++    }
+     uint32_t samplers_overflowed_count = 0;
+     for (uint32_t j = 0; j < 2; ++j) {
+       std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>>& shader_samplers =
+           j ? current_samplers_pixel_ : current_samplers_vertex_;
+-      if (!i) {
++      if (wos_rebuild_samplers) {
+         shader_samplers.clear();
+       }
+       const VulkanShader* shader = j ? pixel_shader : vertex_shader;
+       if (!shader) {
+         continue;
+       }
+-      const std::vector<VulkanShader::SamplerBinding>& shader_sampler_bindings =
+-          shader->GetSamplerBindingsAfterTranslation();
+-      if (!i) {
++      if (wos_rebuild_samplers) {
++        const std::vector<VulkanShader::SamplerBinding>& shader_sampler_bindings =
++            shader->GetSamplerBindingsAfterTranslation();
+         shader_samplers.reserve(shader_sampler_bindings.size());
+         for (const VulkanShader::SamplerBinding& shader_sampler_binding : shader_sampler_bindings) {
+           shader_samplers.emplace_back(texture_cache_->GetSamplerParameters(shader_sampler_binding),
+@@ -3845,12 +4123,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   uint32_t used_texture_mask =
+       vertex_shader->GetUsedTextureMaskAfterTranslation() |
+       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
+-  texture_cache_->RequestTextures(used_texture_mask);
++  WOS_PROBE(d_tex_ns, texture_cache_->RequestTextures(used_texture_mask));
+ 
+   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
+   // Set up the render targets - this may perform dispatches and draws.
+-  if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
+-                                    normalized_color_mask, *vertex_shader)) {
++  if (!WOS_PROBE(d_rt_ns, render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
++                                    normalized_color_mask, *vertex_shader))) {
+     return draw_fail("render_target_update");
+   }
+ 
+@@ -3859,11 +4137,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   // textures.
+   VkPipeline pipeline;
+   void* pipeline_handle = nullptr;
+-  if (!pipeline_cache_->ConfigurePipeline(vertex_shader_translation, pixel_shader_translation,
++  if (!WOS_PROBE(d_pipe_ns, pipeline_cache_->ConfigurePipeline(vertex_shader_translation, pixel_shader_translation,
+                                           primitive_processing_result, normalized_depth_control,
+                                           normalized_color_mask,
+                                           render_target_cache_->last_update_render_pass_key(),
+-                                          pipeline, pipeline_layout_provider, &pipeline_handle)) {
++                                          pipeline, pipeline_layout_provider, &pipeline_handle))) {
+     return draw_fail("configure_pipeline");
+   }
+   bool pipeline_is_placeholder = false;
+@@ -3983,7 +4261,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+ 
+   // Update uniform buffers and descriptor sets after binding the pipeline with
+   // the new layout.
+-  if (!UpdateBindings(vertex_shader, pixel_shader)) {
++  if (!WOS_PROBE(d_bind_ns, UpdateBindings(vertex_shader, pixel_shader))) {
+     return draw_fail("update_bindings");
+   }
+ 
+@@ -4024,7 +4302,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+         vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
+         continue;
+       }
+-      if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2)) {
++      if (!WOS_PROBE(d_vtx_ns, shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2))) {
+         REXGPU_ERROR(
+             "Failed to request vertex buffer at 0x{:08X} (size {}) in the shared "
+             "memory",
+@@ -4125,6 +4403,96 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+       render_target_cache_->last_update_render_pass(),
+       render_target_cache_->last_update_framebuffer());
+ 
++  // WebOfShadowsRecomp native renderer (A2/B): snapshot everything this draw just
++  // configured, for the NON-INDEXED case, so the title's native path can bind and
++  // redraw it into its own target. Everything below (pipeline/layout/descriptor
++  // sets) is final at this point. Pure observation; does not change the draw.
++  {
++    wos_native_draw_snapshot_.valid = false;
++    const bool wos_non_indexed =
++        primitive_processing_result.index_buffer_type ==
++            PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
++        shader_32bit_index_dma;
++    if (wos_non_indexed && current_guest_graphics_pipeline_ != VK_NULL_HANDLE &&
++        current_guest_graphics_pipeline_layout_ != nullptr) {
++      wos_native_draw_snapshot_.pipeline = current_guest_graphics_pipeline_;
++      wos_native_draw_snapshot_.pipeline_layout =
++          current_guest_graphics_pipeline_layout_->GetPipelineLayout();
++      wos_native_draw_snapshot_.descriptor_set_count =
++          uint32_t(SpirvShaderTranslator::kDescriptorSetCount);
++      for (uint32_t i = 0; i < uint32_t(SpirvShaderTranslator::kDescriptorSetCount); ++i) {
++        wos_native_draw_snapshot_.descriptor_sets[i] = current_graphics_descriptor_sets_[i];
++      }
++      wos_native_draw_snapshot_.host_vertex_count =
++          primitive_processing_result.host_draw_vertex_count;
++      wos_native_draw_snapshot_.vertex_shader_hash =
++          vertex_shader ? vertex_shader->ucode_data_hash() : 0;
++      wos_native_draw_snapshot_.pixel_shader_hash =
++          pixel_shader ? pixel_shader->ucode_data_hash() : 0;
++      wos_native_draw_snapshot_.render_pass =
++          render_target_cache_->last_update_render_pass();
++      {
++        auto *fb = render_target_cache_->last_update_framebuffer();
++        if (fb) {
++          wos_native_draw_snapshot_.framebuffer = fb->framebuffer;
++          wos_native_draw_snapshot_.fb_width = fb->host_extent.width;
++          wos_native_draw_snapshot_.fb_height = fb->host_extent.height;
++        }
++      }
++      wos_native_draw_snapshot_.valid =
++          wos_native_draw_snapshot_.render_pass != VK_NULL_HANDLE;
++    }
++    // A2 proof (once): re-render this draw with its own pipeline + descriptor sets
++    // into rexglue's render pass/framebuffer, via our own one-shot command buffer,
++    // submitted on THIS (GPU) thread through AcquireQueue (serialized with rexglue's
++    // own submits) and waited on. Safe here because the transient descriptor sets
++    // are valid on this thread and nothing recycles them under us. One triangle,
++    // once; gated by wos_native_a2.
++    // WoS native: log the first few draws unconditionally, so the log tells us
++    // whether IssueDraw is reached at all before any crash, and what the
++    // snapshot/cvar state actually is.
++    {
++      static uint32_t wos_dbg_draws = 0;
++      if (wos_dbg_draws < 8) {
++        ++wos_dbg_draws;
++        REXGPU_INFO(
++            "[WoS-NATIVE-A2] draw #{}: non_indexed={} snapshot_valid={} "
++            "cvar={} verts={} VS={:016X}",
++            wos_dbg_draws, wos_non_indexed, wos_native_draw_snapshot_.valid,
++            REXCVAR_GET(wos_native_a2),
++            wos_native_draw_snapshot_.host_vertex_count,
++            wos_native_draw_snapshot_.vertex_shader_hash);
++      }
++    }
++
++    // A2a proof (once): emit one draw command of OUR OWN into rexglue's
++    // already-open deferred command buffer, right here. At this point rexglue
++    // has bound the guest pipeline, written and bound the descriptor sets,
++    // entered the render pass and set every dynamic state for this draw -- it
++    // issues the identical call itself a few lines below. So this is the
++    // minimal honest proof that our code can issue a draw which runs rexglue's
++    // real translated vertex+pixel SPIR-V against its real resources, and it
++    // adds no failure surface of its own: no new command buffer, no queue
++    // submit, no state setup to get wrong.
++    if (wos_native_draw_snapshot_.valid && REXCVAR_GET(wos_native_a2) &&
++        !wos_native_a2_done_) {
++      wos_native_a2_done_ = true;
++      REXGPU_INFO(
++          "[WoS-NATIVE-A2a] injecting our own draw: VS {:016X} PS {:016X} "
++          "{} verts, fb {}x{}",
++          wos_native_draw_snapshot_.vertex_shader_hash,
++          wos_native_draw_snapshot_.pixel_shader_hash,
++          wos_native_draw_snapshot_.host_vertex_count,
++          wos_native_draw_snapshot_.fb_width,
++          wos_native_draw_snapshot_.fb_height);
++      deferred_command_buffer_.CmdVkDraw(
++          wos_native_draw_snapshot_.host_vertex_count, 1, 0, 0);
++      REXGPU_INFO(
++          "[WoS-NATIVE-A2a] DONE: our draw command is in rexglue's stream, "
++          "running rexglue's real translated vertex+pixel shaders");
++    }
++  }
++
+   // Draw.
+   if (primitive_processing_result.index_buffer_type ==
+           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
+@@ -4160,6 +4528,32 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+         primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16
+             ? VK_INDEX_TYPE_UINT16
+             : VK_INDEX_TYPE_UINT32);
++    // A2b proof (once): the same injected-draw proof as A2a, for the INDEXED
++    // path. At this exact point rexglue has bound the pipeline, the descriptor
++    // sets, the render pass, all dynamic state AND (just above) the index
++    // buffer -- it issues the identical call on the very next line. So this
++    // proves our code can drive rexglue's real translated SPIR-V for indexed
++    // geometry too, which is ~65% of this game's draws.
++    if (REXCVAR_GET(wos_native_a2) && !wos_native_a2_indexed_done_) {
++      wos_native_a2_indexed_done_ = true;
++      REXGPU_INFO(
++          "[WoS-NATIVE-A2b] injecting our own INDEXED draw: VS {:016X} "
++          "PS {:016X} {} indices, idx{}, type={}",
++          vertex_shader ? vertex_shader->ucode_data_hash() : 0,
++          pixel_shader ? pixel_shader->ucode_data_hash() : 0,
++          primitive_processing_result.host_draw_vertex_count,
++          primitive_processing_result.host_index_format ==
++                  xenos::IndexFormat::kInt16
++              ? 16
++              : 32,
++          uint32_t(primitive_processing_result.index_buffer_type));
++      deferred_command_buffer_.CmdVkDrawIndexed(
++          primitive_processing_result.host_draw_vertex_count, 1, 0, 0, 0);
++      REXGPU_INFO(
++          "[WoS-NATIVE-A2b] DONE: our indexed draw command is in rexglue's "
++          "stream, running rexglue's real translated vertex+pixel shaders");
++    }
++
+     deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
+                                               0, 0, 0);
+   }
+@@ -4392,6 +4786,7 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
+ }
+ 
+ bool VulkanCommandProcessor::IssueCopy() {
++  perf_probe::ScopedNs probe_scope{perf_probe::copy_ns};
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+@@ -4896,6 +5291,7 @@ bool VulkanCommandProcessor::EndGuestOcclusionQuery(uint32_t sample_count_addres
+   if (!EndSubmission(false)) {
+     return false;
+   }
++  ++perf_probe::occlusion_syncs;
+   if (!AwaitAllQueueOperationsCompletion()) {
+     return false;
+   }
+@@ -4974,15 +5370,27 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+ 
+   size_t fences_total = submissions_in_flight_fences_.size();
+   size_t fences_awaited = 0;
++  // Only the fences of submissions made (all of them before a blocking wait)
++  fences_total -= size_t(
++      std::min(uint64_t(fences_total),
++               WosAsyncSubmissionsPending(await_submission > submission_completed_)));
++  if (device_lost_) {
++    return;
++  }
+   if (await_submission > submission_completed_) {
+     // Await in a blocking way if requested.
+     // TODO(Triang3l): Await only one fence. "Fence signal operations that are
+     // defined by vkQueueSubmit additionally include in the first
+     // synchronization scope all commands that occur earlier in submission
+     // order."
++    const auto wait_start = std::chrono::steady_clock::now();
+     VkResult wait_result =
+         dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
+                             submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
++    perf_probe::fence_wait_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                              std::chrono::steady_clock::now() - wait_start)
++                                              .count());
++    ++perf_probe::fence_waits;
+     if (wait_result == VK_SUCCESS) {
+       fences_awaited += await_submission - submission_completed_;
+     } else {
+@@ -5174,6 +5582,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+ 
+   if (is_opening_frame) {
+     frame_open_ = true;
++    wos_samplers_valid_ = false;  // 0024: fresh sampler list each frame
+     frame_used_async_placeholder_pipeline_ = false;
+ 
+     // Reset bindings that depend on transient data.
+@@ -5240,6 +5649,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+ }
+ 
+ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
++  perf_probe::ScopedNs probe_scope{perf_probe::submit_ns};
+   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+@@ -5382,6 +5792,38 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+ 
+     assert_false(command_buffers_writable_.empty());
+     CommandBuffer command_buffer = command_buffers_writable_.back();
++    if (REXCVAR_GET(vulkan_async_submission) && !is_swap) {
++      if (!wos_async_submitter_) {
++        wos_async_submitter_ = std::make_unique<WosAsyncSubmitter>(*this);
++      }
++      assert_false(fences_free_.empty());
++      VkFence fence = fences_free_.back();
++      if (dfn.vkResetFences(device, 1, &fence) != VK_SUCCESS) {
++        REXGPU_ERROR("Failed to reset a Vulkan submission fence");
++        return false;
++      }
++      std::unique_ptr<WosAsyncSubmitter::Job> job = wos_async_submitter_->TakeJob();
++      job->stream.Swap(deferred_command_buffer_);
++      job->pool = command_buffer.pool;
++      job->buffer = command_buffer.buffer;
++      job->wait_semaphores = current_submission_wait_semaphores_;
++      job->wait_stage_masks = current_submission_wait_stage_masks_;
++      job->fence = fence;
++      wos_async_submitter_->Push(std::move(job));
++      uint64_t submission_current = GetCurrentSubmission();
++      current_submission_wait_stage_masks_.clear();
++      for (VkSemaphore semaphore : current_submission_wait_semaphores_) {
++        submissions_in_flight_semaphores_.emplace_back(submission_current, semaphore);
++      }
++      current_submission_wait_semaphores_.clear();
++      command_buffers_submitted_.emplace_back(submission_current, command_buffer);
++      command_buffers_writable_.pop_back();
++      submissions_in_flight_fences_.push_back(fence);
++      fences_free_.pop_back();
++      submission_open_ = false;
++    } else {
++    // Swaps (the presenter submits after them) after the submissions before
++    WosAsyncSubmissionsPending(true);
+     if (dfn.vkResetCommandPool(device, command_buffer.pool, 0) != VK_SUCCESS) {
+       REXGPU_ERROR("Failed to reset a Vulkan command pool");
+       return false;
+@@ -5452,6 +5894,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+     fences_free_.pop_back();
+ 
+     submission_open_ = false;
++    }
+   }
+ 
+   if (is_closing_frame) {
+@@ -5481,6 +5924,11 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+       ClearTransientDescriptorPools();
+ 
+       uniform_buffer_pool_->ClearCache();
++      // The sets refer to the upload buffer pages just destroyed
++      if (wos_constants_pool_ != VK_NULL_HANDLE) {
++        dfn.vkResetDescriptorPool(device, wos_constants_pool_, 0);
++      }
++      wos_constants_sets_.clear();
+ 
+       texture_cache_->ClearCache();
+ 
+@@ -5499,6 +5947,9 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+ }
+ 
+ void VulkanCommandProcessor::ClearTransientDescriptorPools() {
++  for (WosTextureBindingCache& cache : wos_texture_binding_cache_) {
++    cache.set = VK_NULL_HANDLE;
++  }
+   texture_transient_descriptor_sets_free_.clear();
+   texture_transient_descriptor_sets_used_.clear();
+   transient_descriptor_allocator_textures_.Reset();
+@@ -6428,7 +6879,16 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+   constexpr uint32_t kAllConstantBuffersMask =
+       (UINT32_C(1) << SpirvShaderTranslator::kConstantBufferCount) - 1;
+   assert_zero(current_constant_buffers_up_to_date_ & ~kAllConstantBuffersMask);
+-  if ((current_constant_buffers_up_to_date_ & kAllConstantBuffersMask) != kAllConstantBuffersMask) {
++  // WebOfShadowsRecomp (0021): the five buffers are kept in one upload page - the
++  // constants descriptor sets (0014) are cached by the pages the buffers are in,
++  // and with buffers spread over different pages (only the changed ones are
++  // uploaded again, 0020) their combinations ran out of sets. Uploaded again,
++  // all of them, when they ended up in different pages (once more if that
++  // crossed into a new page).
++  for (int wos_pass = 0;
++       wos_pass < 3 && (current_constant_buffers_up_to_date_ & kAllConstantBuffersMask) !=
++                           kAllConstantBuffersMask;
++       ++wos_pass) {
+     current_graphics_descriptor_set_values_up_to_date_ &=
+         ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants);
+     size_t uniform_buffer_alignment =
+@@ -6468,16 +6928,19 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+         return false;
+       }
+       buffer_info.range = VkDeviceSize(float_constants_size);
++      // WebOfShadowsRecomp (0015): runs of used constants in one copy each
+       for (uint32_t i = 0; i < 4; ++i) {
+         uint64_t float_constant_map_entry = current_float_constant_map_vertex_[i];
+-        uint32_t float_constant_index;
+-        while (rex::bit_scan_forward(float_constant_map_entry, &float_constant_index)) {
+-          float_constant_map_entry &= ~(1ull << float_constant_index);
+-          std::memcpy(
+-              mapping,
+-              &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + (i << 8) + (float_constant_index << 2)],
+-              sizeof(float) * 4);
+-          mapping += sizeof(float) * 4;
++        while (float_constant_map_entry) {
++          const uint32_t first = uint32_t(std::countr_zero(float_constant_map_entry));
++          const uint64_t from_first = float_constant_map_entry >> first;
++          const uint32_t count =
++              from_first == UINT64_MAX ? 64 - first : uint32_t(std::countr_one(from_first));
++          std::memcpy(mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + (i << 8) + (first << 2)],
++                      sizeof(float) * 4 * count);
++          mapping += sizeof(float) * 4 * count;
++          float_constant_map_entry &=
++              count + first >= 64 ? 0 : (UINT64_MAX << (first + count));
+         }
+       }
+       current_constant_buffers_up_to_date_ |= UINT32_C(1)
+@@ -6497,16 +6960,19 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+         return false;
+       }
+       buffer_info.range = VkDeviceSize(float_constants_size);
++      // WebOfShadowsRecomp (0015): runs of used constants in one copy each
+       for (uint32_t i = 0; i < 4; ++i) {
+         uint64_t float_constant_map_entry = current_float_constant_map_pixel_[i];
+-        uint32_t float_constant_index;
+-        while (rex::bit_scan_forward(float_constant_map_entry, &float_constant_index)) {
+-          float_constant_map_entry &= ~(1ull << float_constant_index);
+-          std::memcpy(
+-              mapping,
+-              &regs[XE_GPU_REG_SHADER_CONSTANT_256_X + (i << 8) + (float_constant_index << 2)],
+-              sizeof(float) * 4);
+-          mapping += sizeof(float) * 4;
++        while (float_constant_map_entry) {
++          const uint32_t first = uint32_t(std::countr_zero(float_constant_map_entry));
++          const uint64_t from_first = float_constant_map_entry >> first;
++          const uint32_t count =
++              from_first == UINT64_MAX ? 64 - first : uint32_t(std::countr_one(from_first));
++          std::memcpy(mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_256_X + (i << 8) + (first << 2)],
++                      sizeof(float) * 4 * count);
++          mapping += sizeof(float) * 4 * count;
++          float_constant_map_entry &=
++              count + first >= 64 ? 0 : (UINT64_MAX << (first + count));
+         }
+       }
+       current_constant_buffers_up_to_date_ |= UINT32_C(1)
+@@ -6546,6 +7012,12 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+       current_constant_buffers_up_to_date_ |= UINT32_C(1)
+                                               << SpirvShaderTranslator::kConstantBufferFetch;
+     }
++    for (uint32_t i = 1; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
++      if (current_constant_buffer_infos_[i].buffer != current_constant_buffer_infos_[0].buffer) {
++        current_constant_buffers_up_to_date_ = 0;
++        break;
++      }
++    }
+   }
+ 
+   // Textures and samplers.
+@@ -6569,26 +7041,10 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+     sampler_count_pixel = 0;
+     texture_count_pixel = 0;
+   }
+-  // TODO(Triang3l): Reuse texture and sampler bindings if not changed.
+-  current_graphics_descriptor_set_values_up_to_date_ &=
+-      ~((UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex) |
+-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
+-
+-  // Make sure new descriptor sets are bound to the command buffer.
+-
+-  current_graphics_descriptor_sets_bound_up_to_date_ &=
+-      current_graphics_descriptor_set_values_up_to_date_;
+-
+-  // Fill the texture and sampler write image infos.
+-
+-  bool write_vertex_textures =
+-      (texture_count_vertex || sampler_count_vertex) &&
+-      !(current_graphics_descriptor_set_values_up_to_date_ &
+-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex));
+-  bool write_pixel_textures =
+-      (texture_count_pixel || sampler_count_pixel) &&
+-      !(current_graphics_descriptor_set_values_up_to_date_ &
+-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
++  // WebOfShadowsRecomp: the texture and sampler bindings are reused below when
++  // they're the same as the ones last written for the stage in this frame.
++  bool write_vertex_textures = texture_count_vertex || sampler_count_vertex;
++  bool write_pixel_textures = texture_count_pixel || sampler_count_pixel;
+   descriptor_write_image_info_.clear();
+   descriptor_write_image_info_.reserve(
+       (write_vertex_textures ? texture_count_vertex + sampler_count_vertex : 0) +
+@@ -6634,6 +7090,75 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+     }
+   }
+ 
++  // WebOfShadowsRecomp: reuse the stage's last texture descriptor set when its
++  // contents would be the same (a transient set stays valid within its frame).
++  {
++    struct WosStage {
++      bool* write;
++      uint32_t texture_count, sampler_count;
++      size_t texture_offset, sampler_offset;
++      VkDescriptorSetLayout layout;
++      uint32_t set_index;
++    } wos_stages[2] = {
++        {&write_vertex_textures, texture_count_vertex, sampler_count_vertex,
++         vertex_texture_image_info_offset, vertex_sampler_image_info_offset,
++         write_vertex_textures
++             ? current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_vertex_ref()
++             : VK_NULL_HANDLE,
++         SpirvShaderTranslator::kDescriptorSetTexturesVertex},
++        {&write_pixel_textures, texture_count_pixel, sampler_count_pixel,
++         pixel_texture_image_info_offset, pixel_sampler_image_info_offset,
++         write_pixel_textures
++             ? current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_pixel_ref()
++             : VK_NULL_HANDLE,
++         SpirvShaderTranslator::kDescriptorSetTexturesPixel},
++    };
++    for (uint32_t stage = 0; stage < 2; ++stage) {
++      WosStage& st = wos_stages[stage];
++      const uint32_t bit = UINT32_C(1) << st.set_index;
++      if (!*st.write) {
++        continue;
++      }
++      WosTextureBindingCache& cache = wos_texture_binding_cache_[stage];
++      bool same = cache.set != VK_NULL_HANDLE && cache.frame == frame_current_ &&
++                  cache.layout == st.layout && cache.texture_count == st.texture_count &&
++                  cache.sampler_count == st.sampler_count;
++      if (same) {
++        const VkDescriptorImageInfo* infos = descriptor_write_image_info_.data();
++        for (uint32_t i = 0; same && i < st.texture_count; ++i) {
++          const VkDescriptorImageInfo& a = infos[st.texture_offset + i];
++          const VkDescriptorImageInfo& b = cache.infos[i];
++          same = a.imageView == b.imageView && a.imageLayout == b.imageLayout;
++        }
++        for (uint32_t i = 0; same && i < st.sampler_count; ++i) {
++          same = infos[st.sampler_offset + i].sampler == cache.infos[st.texture_count + i].sampler;
++        }
++      }
++      if (same) {
++        if (wos_probe::IsEnabled()) {  // 0028
++          perf_probe::tex_bind_hits.fetch_add(1, std::memory_order_relaxed);
++        }
++        *st.write = false;
++        if (current_graphics_descriptor_sets_[st.set_index] != cache.set ||
++            !(current_graphics_descriptor_set_values_up_to_date_ & bit)) {
++          current_graphics_descriptor_sets_[st.set_index] = cache.set;
++          current_graphics_descriptor_set_values_up_to_date_ |= bit;
++          current_graphics_descriptor_sets_bound_up_to_date_ &= ~bit;
++        }
++      } else {
++        if (wos_probe::IsEnabled()) {  // 0028
++          perf_probe::tex_bind_misses.fetch_add(1, std::memory_order_relaxed);
++        }
++        current_graphics_descriptor_set_values_up_to_date_ &= ~bit;
++      }
++    }
++  }
++
++  // Make sure new descriptor sets are bound to the command buffer.
++
++  current_graphics_descriptor_sets_bound_up_to_date_ &=
++      current_graphics_descriptor_set_values_up_to_date_;
++
+   // Write the new descriptor sets.
+ 
+   // Consecutive bindings updated via a single VkWriteDescriptorSet must have
+@@ -6645,38 +7170,84 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+   uint32_t write_descriptor_set_bits = 0;
+   assert_not_zero(current_graphics_descriptor_set_values_up_to_date_ &
+                   (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetSharedMemoryAndEdram));
+-  // Constant buffers.
++  // Constant buffers (WebOfShadowsRecomp 0014): the set for the pages the
++  // buffers are in, written once with each buffer's largest range, and this
++  // draw's offsets in it, bound with it below.
+   if (!(current_graphics_descriptor_set_values_up_to_date_ &
+         (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants))) {
+-    VkDescriptorSet constants_descriptor_set;
+-    if (!constants_transient_descriptors_free_.empty()) {
+-      constants_descriptor_set = constants_transient_descriptors_free_.back();
+-      constants_transient_descriptors_free_.pop_back();
+-    } else {
+-      VkDescriptorPoolSize constants_descriptor_count;
+-      constants_descriptor_count.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+-      constants_descriptor_count.descriptorCount = SpirvShaderTranslator::kConstantBufferCount;
+-      constants_descriptor_set = transient_descriptor_allocator_uniform_buffer_.Allocate(
+-          descriptor_set_layout_constants_, &constants_descriptor_count, 1);
+-      if (constants_descriptor_set == VK_NULL_HANDLE) {
++    static constexpr VkDeviceSize kConstantRanges[SpirvShaderTranslator::kConstantBufferCount] = {
++        sizeof(SpirvShaderTranslator::SystemConstants), sizeof(float) * 4 * 256,
++        sizeof(float) * 4 * 256, sizeof(uint32_t) * (8 + 32), sizeof(uint32_t) * 6 * 32};
++    static_assert(SpirvShaderTranslator::kConstantBufferSystem == 0 &&
++                  SpirvShaderTranslator::kConstantBufferFloatVertex == 1 &&
++                  SpirvShaderTranslator::kConstantBufferFloatPixel == 2 &&
++                  SpirvShaderTranslator::kConstantBufferBoolLoop == 3 &&
++                  SpirvShaderTranslator::kConstantBufferFetch == 4);
++    VkDescriptorSet constants_descriptor_set = VK_NULL_HANDLE;
++    for (const WosConstantsSet& cached : wos_constants_sets_) {
++      bool same = true;
++      for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
++        same &= cached.buffers[i] == current_constant_buffer_infos_[i].buffer;
++      }
++      if (same) {
++        constants_descriptor_set = cached.set;
++        break;
++      }
++    }
++    if (constants_descriptor_set == VK_NULL_HANDLE) {
++      if (wos_constants_pool_ == VK_NULL_HANDLE) {
++        VkDescriptorPoolSize pool_size;
++        pool_size.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
++        pool_size.descriptorCount = 1024 * SpirvShaderTranslator::kConstantBufferCount;
++        VkDescriptorPoolCreateInfo pool_create_info = {};
++        pool_create_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
++        pool_create_info.maxSets = 1024;
++        pool_create_info.poolSizeCount = 1;
++        pool_create_info.pPoolSizes = &pool_size;
++        if (dfn.vkCreateDescriptorPool(device, &pool_create_info, nullptr,
++                                       &wos_constants_pool_) != VK_SUCCESS) {
++          REXGPU_ERROR("Failed to create the guest draw constants descriptor pool");
++          return false;
++        }
++      }
++      VkDescriptorSetAllocateInfo allocate_info = {};
++      allocate_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
++      allocate_info.descriptorPool = wos_constants_pool_;
++      allocate_info.descriptorSetCount = 1;
++      allocate_info.pSetLayouts = &descriptor_set_layout_constants_;
++      if (dfn.vkAllocateDescriptorSets(device, &allocate_info, &constants_descriptor_set) !=
++          VK_SUCCESS) {
++        REXGPU_ERROR("Out of guest draw constants descriptor sets ({} upload page combinations)",
++                     wos_constants_sets_.size());
+         return false;
+       }
++      WosConstantsSet& cached = wos_constants_sets_.emplace_back();
++      cached.set = constants_descriptor_set;
++      VkDescriptorBufferInfo buffer_infos[SpirvShaderTranslator::kConstantBufferCount];
++      for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
++        cached.buffers[i] = current_constant_buffer_infos_[i].buffer;
++        buffer_infos[i].buffer = current_constant_buffer_infos_[i].buffer;
++        buffer_infos[i].offset = 0;
++        buffer_infos[i].range = kConstantRanges[i];
++        VkWriteDescriptorSet& write_constants = write_descriptor_sets[write_descriptor_set_count++];
++        write_constants.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++        write_constants.pNext = nullptr;
++        write_constants.dstSet = constants_descriptor_set;
++        write_constants.dstBinding = i;
++        write_constants.dstArrayElement = 0;
++        write_constants.descriptorCount = 1;
++        write_constants.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
++        write_constants.pImageInfo = nullptr;
++        write_constants.pBufferInfo = &buffer_infos[i];
++        write_constants.pTexelBufferView = nullptr;
++      }
++      // Written right away: buffer_infos is local
++      dfn.vkUpdateDescriptorSets(device, write_descriptor_set_count, write_descriptor_sets.data(),
++                                 0, nullptr);
++      write_descriptor_set_count = 0;
+     }
+-    constants_transient_descriptors_used_.emplace_back(frame_current_, constants_descriptor_set);
+-    // Consecutive bindings updated via a single VkWriteDescriptorSet must have
+-    // identical stage flags, but for the constants they vary.
+     for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
+-      VkWriteDescriptorSet& write_constants = write_descriptor_sets[write_descriptor_set_count++];
+-      write_constants.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+-      write_constants.pNext = nullptr;
+-      write_constants.dstSet = constants_descriptor_set;
+-      write_constants.dstBinding = i;
+-      write_constants.dstArrayElement = 0;
+-      write_constants.descriptorCount = 1;
+-      write_constants.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+-      write_constants.pImageInfo = nullptr;
+-      write_constants.pBufferInfo = &current_constant_buffer_infos_[i];
+-      write_constants.pTexelBufferView = nullptr;
++      wos_constants_offsets_[i] = uint32_t(current_constant_buffer_infos_[i].offset);
+     }
+     write_descriptor_set_bits |= UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants;
+     current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetConstants] =
+@@ -6696,6 +7267,18 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+     }
+     write_descriptor_set_count += texture_descriptor_set_write_count;
+     write_descriptor_set_bits |= UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex;
++    {
++      WosTextureBindingCache& cache = wos_texture_binding_cache_[0];
++      cache.set = write_textures[0].dstSet;
++      cache.frame = frame_current_;
++      cache.layout = current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_vertex_ref();
++      cache.texture_count = texture_count_vertex;
++      cache.sampler_count = sampler_count_vertex;
++      cache.infos.assign(descriptor_write_image_info_.data() + vertex_texture_image_info_offset,
++                         descriptor_write_image_info_.data() + vertex_texture_image_info_offset + texture_count_vertex);
++      cache.infos.insert(cache.infos.end(), descriptor_write_image_info_.data() + vertex_sampler_image_info_offset,
++                         descriptor_write_image_info_.data() + vertex_sampler_image_info_offset + sampler_count_vertex);
++    }
+     current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesVertex] =
+         write_textures[0].dstSet;
+   }
+@@ -6713,6 +7296,18 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+     }
+     write_descriptor_set_count += texture_descriptor_set_write_count;
+     write_descriptor_set_bits |= UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel;
++    {
++      WosTextureBindingCache& cache = wos_texture_binding_cache_[1];
++      cache.set = write_textures[0].dstSet;
++      cache.frame = frame_current_;
++      cache.layout = current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_pixel_ref();
++      cache.texture_count = texture_count_pixel;
++      cache.sampler_count = sampler_count_pixel;
++      cache.infos.assign(descriptor_write_image_info_.data() + pixel_texture_image_info_offset,
++                         descriptor_write_image_info_.data() + pixel_texture_image_info_offset + texture_count_pixel);
++      cache.infos.insert(cache.infos.end(), descriptor_write_image_info_.data() + pixel_sampler_image_info_offset,
++                         descriptor_write_image_info_.data() + pixel_sampler_image_info_offset + sampler_count_pixel);
++    }
+     current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesPixel] =
+         write_textures[0].dstSet;
+   }
+@@ -6735,6 +7330,16 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+   }
+   uint32_t descriptor_sets_remaining =
+       descriptor_sets_needed & ~current_graphics_descriptor_sets_bound_up_to_date_;
++  // WebOfShadowsRecomp (0014): the constants with their dynamic offsets
++  if (descriptor_sets_remaining & (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants)) {
++    descriptor_sets_remaining &= ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants);
++    deferred_command_buffer_.CmdVkBindDescriptorSets(
++        VK_PIPELINE_BIND_POINT_GRAPHICS,
++        current_guest_graphics_pipeline_layout_->GetPipelineLayout(),
++        SpirvShaderTranslator::kDescriptorSetConstants, 1,
++        current_graphics_descriptor_sets_ + SpirvShaderTranslator::kDescriptorSetConstants,
++        SpirvShaderTranslator::kConstantBufferCount, wos_constants_offsets_);
++  }
+   uint32_t descriptor_set_index;
+   while (rex::bit_scan_forward(descriptor_sets_remaining, &descriptor_set_index)) {
+     uint32_t descriptor_set_mask_tzcnt =
+@@ -6834,4 +7439,217 @@ uint32_t VulkanCommandProcessor::WriteTransientTextureBindings(
+   return descriptor_set_write_count;
+ }
+ 
++// WebOfShadowsRecomp native renderer (A2/B): copy the current-draw snapshot out of
++// the command processor into the light POD the title uses. Declared in the
++// standalone rex/graphics/vulkan/wos_native_snapshot.h so the title need not pull
++// in this heavy TU's headers. Pure read.
++void VulkanCommandProcessor::WosNativeA2ProofOnce() {
++  auto HX = [](auto h) -> uint64_t {
++    return uint64_t(reinterpret_cast<uintptr_t>(h));
++  };
++  const WosNativeDrawSnapshot& s = wos_native_draw_snapshot_;
++
++  REXGPU_INFO(
++      "[WoS-NATIVE-A2] p0 enter: valid={} pipe={:016X} layout={:016X} "
++      "rp={:016X} fb={:016X} {}x{} sets={} verts={} VS={:016X} PS={:016X}",
++      s.valid, HX(s.pipeline), HX(s.pipeline_layout), HX(s.render_pass),
++      HX(s.framebuffer), s.fb_width, s.fb_height, s.descriptor_set_count,
++      s.host_vertex_count, s.vertex_shader_hash, s.pixel_shader_hash);
++
++  for (uint32_t i = 0; i < s.descriptor_set_count && i < 4; ++i) {
++    REXGPU_INFO("[WoS-NATIVE-A2] p0 set[{}] = {:016X}", i,
++                HX(s.descriptor_sets[i]));
++  }
++
++  if (!s.valid || s.pipeline == VK_NULL_HANDLE ||
++      s.pipeline_layout == VK_NULL_HANDLE || s.render_pass == VK_NULL_HANDLE ||
++      s.framebuffer == VK_NULL_HANDLE || s.fb_width == 0 || s.fb_height == 0) {
++    REXGPU_INFO("[WoS-NATIVE-A2] p0 FAIL: snapshot incomplete; skipping proof");
++    return;
++  }
++  if (s.host_vertex_count == 0) {
++    REXGPU_INFO("[WoS-NATIVE-A2] p0 FAIL: zero vertices; skipping proof");
++    return;
++  }
++
++  // Bind only the contiguous non-null prefix. current_graphics_descriptor_sets_
++  // holds VK_NULL_HANDLE for sets this pipeline doesn't use, and handing a null
++  // set to vkCmdBindDescriptorSets is a null deref inside the driver.
++  uint32_t bind_count = 0;
++  while (bind_count < s.descriptor_set_count && bind_count < 4 &&
++         s.descriptor_sets[bind_count] != VK_NULL_HANDLE) {
++    ++bind_count;
++  }
++  REXGPU_INFO("[WoS-NATIVE-A2] p1 binding {} of {} descriptor sets", bind_count,
++              s.descriptor_set_count);
++
++  const ui::vulkan::VulkanDevice* device_ptr = GetVulkanDevice();
++  if (!device_ptr) {
++    REXGPU_INFO("[WoS-NATIVE-A2] p1 FAIL: no VulkanDevice");
++    return;
++  }
++  const ui::vulkan::VulkanDevice& device = *device_ptr;
++  const VkDevice dev = device.device();
++  const ui::vulkan::VulkanDevice::Functions& df = device.functions();
++  const uint32_t qfam = device.queue_family_graphics_compute();
++  REXGPU_INFO("[WoS-NATIVE-A2] p2 device={:016X} qfam={}", HX(dev), qfam);
++
++  VkCommandPool pool = VK_NULL_HANDLE;
++  VkCommandBuffer cmd = VK_NULL_HANDLE;
++  VkFence fence = VK_NULL_HANDLE;
++  auto cleanup = [&]() {
++    if (fence != VK_NULL_HANDLE) {
++      df.vkDestroyFence(dev, fence, nullptr);
++    }
++    if (pool != VK_NULL_HANDLE) {
++      df.vkDestroyCommandPool(dev, pool, nullptr);
++    }
++  };
++
++  VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
++  pci.queueFamilyIndex = qfam;
++  pci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
++  if (df.vkCreateCommandPool(dev, &pci, nullptr, &pool) != VK_SUCCESS) {
++    REXGPU_INFO("[WoS-NATIVE-A2] p3 FAIL: command pool");
++    cleanup();
++    return;
++  }
++  VkCommandBufferAllocateInfo cai{
++      VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
++  cai.commandPool = pool;
++  cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++  cai.commandBufferCount = 1;
++  if (df.vkAllocateCommandBuffers(dev, &cai, &cmd) != VK_SUCCESS) {
++    REXGPU_INFO("[WoS-NATIVE-A2] p4 FAIL: cmd alloc");
++    cleanup();
++    return;
++  }
++  REXGPU_INFO("[WoS-NATIVE-A2] p5 cmd={:016X}", HX(cmd));
++
++  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++  bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++  df.vkBeginCommandBuffer(cmd, &bi);
++
++  // Always hand vkCmdBeginRenderPass a real clear-value array: if any
++  // attachment in rexglue's render pass has LOAD_OP_CLEAR, a null pClearValues
++  // is read through by the driver (SIGSEGV, fault address 0). A count larger
++  // than the attachment count is explicitly permitted by the spec.
++  VkClearValue clears[8] = {};
++  VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
++  rbi.renderPass = s.render_pass;
++  rbi.framebuffer = s.framebuffer;
++  rbi.renderArea.offset.x = 0;
++  rbi.renderArea.offset.y = 0;
++  rbi.renderArea.extent.width = s.fb_width;
++  rbi.renderArea.extent.height = s.fb_height;
++  rbi.clearValueCount = 8u;
++  rbi.pClearValues = clears;
++  REXGPU_INFO("[WoS-NATIVE-A2] p6 begin render pass");
++  df.vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
++
++  REXGPU_INFO("[WoS-NATIVE-A2] p7 bind pipeline");
++  df.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.pipeline);
++
++  // rexglue's guest pipelines enable dynamic viewport / scissor / depth bias /
++  // blend constants / stencil reference. Drawing with any of them never set is
++  // undefined behaviour and faults inside RADV, so set all of them.
++  VkViewport vp{};
++  vp.x = 0.0f;
++  vp.y = 0.0f;
++  vp.width = float(s.fb_width);
++  vp.height = float(s.fb_height);
++  vp.minDepth = 0.0f;
++  vp.maxDepth = 1.0f;
++  VkRect2D sc{};
++  sc.offset.x = 0;
++  sc.offset.y = 0;
++  sc.extent.width = s.fb_width;
++  sc.extent.height = s.fb_height;
++  const float blend_constants[4] = {0.0f, 0.0f, 0.0f, 0.0f};
++  REXGPU_INFO("[WoS-NATIVE-A2] p8 dynamic state");
++  df.vkCmdSetViewport(cmd, 0, 1, &vp);
++  df.vkCmdSetScissor(cmd, 0, 1, &sc);
++  df.vkCmdSetDepthBias(cmd, 0.0f, 0.0f, 0.0f);
++  df.vkCmdSetBlendConstants(cmd, blend_constants);
++  df.vkCmdSetStencilReference(cmd, VK_STENCIL_FRONT_AND_BACK, 0);
++
++  if (bind_count) {
++    REXGPU_INFO("[WoS-NATIVE-A2] p9 bind descriptor sets");
++    df.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
++                               s.pipeline_layout, 0, bind_count,
++                               s.descriptor_sets, 0, nullptr);
++  }
++
++  REXGPU_INFO("[WoS-NATIVE-A2] p10 draw {} verts", s.host_vertex_count);
++  df.vkCmdDraw(cmd, s.host_vertex_count, 1, 0, 0);
++  df.vkCmdEndRenderPass(cmd);
++  if (df.vkEndCommandBuffer(cmd) != VK_SUCCESS) {
++    REXGPU_INFO("[WoS-NATIVE-A2] p11 FAIL: end command buffer");
++    cleanup();
++    return;
++  }
++
++  VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
++  if (df.vkCreateFence(dev, &fci, nullptr, &fence) != VK_SUCCESS) {
++    REXGPU_INFO("[WoS-NATIVE-A2] p12 FAIL: fence");
++    cleanup();
++    return;
++  }
++
++  REXGPU_INFO("[WoS-NATIVE-A2] p13 submit");
++  VkResult sr;
++  {
++    auto acq = device.AcquireQueue(qfam, 0);
++    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
++    si.commandBufferCount = 1;
++    si.pCommandBuffers = &cmd;
++    sr = df.vkQueueSubmit(acq.queue(), 1, &si, fence);
++  }
++  if (sr != VK_SUCCESS) {
++    REXGPU_INFO("[WoS-NATIVE-A2] p13 FAIL: queue submit ({})", int(sr));
++    cleanup();
++    return;
++  }
++
++  REXGPU_INFO("[WoS-NATIVE-A2] p14 wait");
++  df.vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX);
++  cleanup();
++
++  REXGPU_INFO(
++      "[WoS-NATIVE-A2] DONE: drew rexglue's real translated shader natively "
++      "(VS {:016X}, {} verts, {} sets)",
++      s.vertex_shader_hash, s.host_vertex_count, bind_count);
++}
++
++bool WosNativeGetDrawSnapshot(system::IGraphicsSystem* graphics_system,
++                              WosNativeSnapshot* out) {
++  if (out) {
++    *out = WosNativeSnapshot{};
++  }
++  if (!graphics_system || !out) {
++    return false;
++  }
++  auto* gs = static_cast<GraphicsSystem*>(graphics_system);
++  auto* cp = static_cast<VulkanCommandProcessor*>(gs->command_processor());
++  if (!cp) {
++    return false;
++  }
++  const VulkanCommandProcessor::WosNativeDrawSnapshot& s = cp->wos_native_draw_snapshot();
++  out->valid = s.valid;
++  out->pipeline = s.pipeline;
++  out->pipeline_layout = s.pipeline_layout;
++  for (uint32_t i = 0; i < 4 && i < uint32_t(SpirvShaderTranslator::kDescriptorSetCount); ++i) {
++    out->descriptor_sets[i] = s.descriptor_sets[i];
++  }
++  out->descriptor_set_count = s.descriptor_set_count;
++  out->host_vertex_count = s.host_vertex_count;
++  out->vertex_shader_hash = s.vertex_shader_hash;
++  out->pixel_shader_hash = s.pixel_shader_hash;
++  out->render_pass = s.render_pass;
++  out->framebuffer = s.framebuffer;
++  out->fb_width = s.fb_width;
++  out->fb_height = s.fb_height;
++  return true;
++}
++
+ }  // namespace rex::graphics::vulkan
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index 91ac08f6c11d065793da02000b91057c73e2aa86..89c863f49790ab1e086f93322e93c90a5c7f3d5b 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -59,6 +59,11 @@ REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
+                     "Render tessellation as wireframe")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++#include <atomic>
++#include <rex/graphics/wos_probe_clock.h>
++namespace rex::graphics::perf_probe {  // src/graphics/command_processor.cpp
++extern std::atomic<uint64_t> hitch_pipelines, hitch_pipeline_ns;
++}
+ namespace rex::graphics::vulkan {
+ 
+ namespace {
+@@ -556,6 +561,8 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+       shader->set_ucode_storage_index(shader_storage_index_);
+     }
+     rex::filesystem::TruncateStdioFile(shader_storage_file_, shader_storage_valid_bytes);
++    // As for the pipelines below: a seek between the last read and the first write
++    rex::filesystem::Seek(shader_storage_file_, 0, SEEK_END);
+   } else {
+     rex::filesystem::TruncateStdioFile(shader_storage_file_, 0);
+     shader_storage_file_header.magic = shader_storage_magic;
+@@ -693,6 +700,10 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+       pipeline_storage_file_,
+       uint64_t(sizeof(pipeline_storage_file_header) +
+                sizeof(PipelineStoredDescription) * pipeline_stored_descriptions.size()));
++  // The stream was last read: C requires a seek before it is written. glibc lets
++  // a write follow a read anyway; the PS5's libc does not, and every pipeline the
++  // storage writer appended after the first run was lost.
++  rex::filesystem::Seek(pipeline_storage_file_, 0, SEEK_END);
+   if (pipeline_stored_descriptions.empty()) {
+     rex::filesystem::TruncateStdioFile(pipeline_storage_file_, 0);
+     pipeline_storage_file_header.magic = pipeline_storage_magic;
+@@ -1024,6 +1035,13 @@ bool VulkanPipelineCache::EnsureShadersTranslated(VulkanShader::VulkanTranslatio
+       REXGPU_ERROR("Failed to translate the vertex shader!");
+       return false;
+     }
++    // Dump the raw Xbox 360 ucode and the translated SPIR-V when asked
++    // (dump_shaders=<path>). The ucode here is clean, host-native, and correctly
++    // located by the command processor - the form a native renderer wants.
++    if (!REXCVAR_GET(dump_shaders).empty()) {
++      vertex_shader->shader().DumpUcode(REXCVAR_GET(dump_shaders));
++      vertex_shader->Dump(REXCVAR_GET(dump_shaders), "vulkan");
++    }
+   }
+   if (!vertex_shader->is_valid()) {
+     // Translation attempted previously, but not valid.
+@@ -1036,6 +1054,10 @@ bool VulkanPipelineCache::EnsureShadersTranslated(VulkanShader::VulkanTranslatio
+         REXGPU_ERROR("Failed to translate the pixel shader!");
+         return false;
+       }
++      if (!REXCVAR_GET(dump_shaders).empty()) {
++        pixel_shader->shader().DumpUcode(REXCVAR_GET(dump_shaders));
++        pixel_shader->Dump(REXCVAR_GET(dump_shaders), "vulkan");
++      }
+     }
+     if (!pixel_shader->is_valid()) {
+       // Translation attempted previously, but not valid.
+@@ -1148,6 +1170,15 @@ bool VulkanPipelineCache::ConfigurePipeline(
+   }
+ 
+   // Create the pipeline if not already existing.
++  // WebOfShadowsRecomp (0019): counted and timed for the title's hitch log
++  struct WosNewPipelineScope {
++    uint64_t start = ::rex::graphics::wos_probe::NowNs();
++    ~WosNewPipelineScope() {
++      ::rex::graphics::perf_probe::hitch_pipelines.fetch_add(1, std::memory_order_relaxed);
++      ::rex::graphics::perf_probe::hitch_pipeline_ns.fetch_add(
++          ::rex::graphics::wos_probe::NowNs() - start, std::memory_order_relaxed);
++    }
++  } wos_new_pipeline_scope;
+   auto& pipeline = *pipelines_.emplace(description, Pipeline()).first;
+   PipelineCreationArguments creation_arguments_real;
+   if (!TryGetPipelineCreationArgumentsForDescription(description, &pipeline,
+diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
+index ecbd940d8fa4dac148808f8d88ca0dd1967b6e1c..e3025b1d819eaa459878b969ec132daadfcfbc4a 100644
+--- a/src/graphics/vulkan/texture_cache.cpp
++++ b/src/graphics/vulkan/texture_cache.cpp
+@@ -671,8 +671,47 @@ VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView(uint32_t fetch_c
+   }
+ }
+ 
++// WebOfShadowsRecomp (0013): the parameters depend only on the fetch constant,
++// the binding's filters and the anisotropy setting, and were worked out for
++// every sampler of every draw (5% of the command processor's time): a small
++// direct-mapped cache of the last results, on the command processor's thread.
+ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
+     const VulkanShader::SamplerBinding& binding) const {
++  struct Entry {
++    uint32_t fetch[6];
++    uint32_t filters;
++    int32_t anisotropic_override;
++    const VulkanTextureCache* cache;
++    SamplerParameters parameters;
++  };
++  static thread_local Entry entries[512];
++  const uint32_t* fetch =
++      &register_file().values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + binding.fetch_constant * 6];
++  const uint32_t filters = uint32_t(binding.mag_filter) | (uint32_t(binding.min_filter) << 4) |
++                           (uint32_t(binding.mip_filter) << 8) |
++                           (uint32_t(binding.aniso_filter) << 12) | (binding.fetch_constant << 16);
++  const int32_t anisotropic_override = REXCVAR_GET(anisotropic_override);
++  uint64_t hash = filters * 0x9E3779B97F4A7C15ull;
++  for (int i = 0; i < 6; ++i) {
++    hash = (hash ^ fetch[i]) * 0x100000001B3ull;
++  }
++  Entry& entry = entries[(hash >> 32) & 511];
++  if (entry.cache == this && entry.filters == filters &&
++      entry.anisotropic_override == anisotropic_override &&
++      std::memcmp(entry.fetch, fetch, sizeof entry.fetch) == 0) {
++    return entry.parameters;
++  }
++  SamplerParameters parameters = GetSamplerParametersUncached(binding);
++  std::memcpy(entry.fetch, fetch, sizeof entry.fetch);
++  entry.filters = filters;
++  entry.anisotropic_override = anisotropic_override;
++  entry.cache = this;
++  entry.parameters = parameters;
++  return parameters;
++}
++
++VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParametersUncached(
++    const VulkanShader::SamplerBinding& binding) const {
+   const auto& regs = register_file();
+   xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(binding.fetch_constant);
+ 
+diff --git a/src/system/mmio_handler.cpp b/src/system/mmio_handler.cpp
+index 2b930058bad8ef3c9832e82e0e9b50491425ec82..a0c4210aa7a7b43216c0fe9c4f6870d3379e20b3 100644
+--- a/src/system/mmio_handler.cpp
++++ b/src/system/mmio_handler.cpp
+@@ -9,6 +9,8 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <atomic>
++#include <chrono>
+ #include <algorithm>
+ #include <cstring>
+ #include <utility>
+@@ -368,7 +370,18 @@ bool MMIOHandler::ExceptionCallbackThunk(arch::Exception* ex, void* data) {
+   return reinterpret_cast<MMIOHandler*>(data)->ExceptionCallback(ex);
+ }
+ 
++// WebOfShadowsRecomp (wos/patches/rexglue/0004): access faults handled, counted and timed
++std::atomic<uint64_t> g_wos_fault_calls{0}, g_wos_fault_ns{0};
+ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
++  const auto start = std::chrono::steady_clock::now();
++  const bool result = ExceptionCallbackImpl(ex);
++  g_wos_fault_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                 std::chrono::steady_clock::now() - start)
++                                 .count());
++  ++g_wos_fault_calls;
++  return result;
++}
++bool MMIOHandler::ExceptionCallbackImpl(arch::Exception* ex) {
+   if (ex->code() != arch::Exception::Code::kAccessViolation) {
+     return false;
+   }
+@@ -527,3 +540,20 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
+ }
+ 
+ }  // namespace rex::runtime
++
++// WebOfShadowsRecomp (wos/patches/rexglue/0004): the counters for the title's log
++#if REX_PLATFORM_PS5
++namespace rex::memory {
++extern std::atomic<uint64_t> g_wos_protect_calls, g_wos_protect_ns;
++}  // namespace rex::memory
++#endif
++extern "C" void rex_mem_perf_take(uint64_t* out) {
++#if REX_PLATFORM_PS5
++  out[0] = rex::memory::g_wos_protect_calls.exchange(0);
++  out[1] = rex::memory::g_wos_protect_ns.exchange(0);
++#else
++  out[0] = out[1] = 0;
++#endif
++  out[2] = rex::runtime::g_wos_fault_calls.exchange(0);
++  out[3] = rex::runtime::g_wos_fault_ns.exchange(0);
++}
+diff --git a/src/ui/overlay/achievement_toast.cpp b/src/ui/overlay/achievement_toast.cpp
+index 53b8c0b49f70c4eda29b912768d03c34b89baf31..ea515c755e841622af18bbbb13083987b26b472f 100644
+--- a/src/ui/overlay/achievement_toast.cpp
++++ b/src/ui/overlay/achievement_toast.cpp
+@@ -20,7 +20,25 @@ namespace rex::ui {
+ AchievementToastDialog::AchievementToastDialog(ImGuiDrawer* drawer,
+                                                ImmediateDrawer* immediate_drawer,
+                                                rex::Runtime* runtime)
+-    : AchievementNotificationDialog(drawer), icon_cache_(immediate_drawer, runtime) {}
++    : AchievementNotificationDialog(drawer), icon_cache_(immediate_drawer, runtime) {
++  // WebOfShadowsRecomp (0022): a UI drawer only while a toast is showing. A
++  // registered drawer keeps the presenter painting on the UI thread at every
++  // display refresh, whichever guest frame is newest, instead of once per guest
++  // frame - uneven frame times on screen at 30 fps. Joins at a Push
++  // (ShowPendingFromUIThread), leaves when its queue runs out (OnDraw).
++  imgui_drawer()->RemoveDialog(this);
++}
++
++void AchievementToastDialog::ShowPendingFromUIThread() {
++  bool pending;
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    pending = !queue_.empty();
++  }
++  if (pending) {
++    imgui_drawer()->AddDialog(this);
++  }
++}
+ 
+ AchievementToastDialog::~AchievementToastDialog() {}
+ 
+@@ -48,6 +66,8 @@ void AchievementToastDialog::OnDraw(ImGuiIO& io) {
+       }
+     }
+     if (queue_.empty()) {
++      // 0022: nothing more to show - out of the UI drawers until the next Push
++      imgui_drawer()->RemoveDialog(this);
+       return;
+     }
+     toast = queue_.front();
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index 7bd277a2dfd9a4136144ece2aac332fa7b3e3a0d..61e282b9ea53b25f27161fa2db7796e179afc667 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -561,10 +561,17 @@ void ReXApp::LaunchModule() {
+     if (achievement_notification_ && achievement_notification_listener_ == 0 && runtime_ &&
+         runtime_->kernel_state()) {
+       std::weak_ptr<ui::AchievementNotificationDialog> notification = achievement_notification_;
++      ui::WindowedAppContext* ui_context = &app_context();
+       achievement_notification_listener_ = achievements().RegisterNotificationCallback(
+-          [notification](const rex::system::AchievementEvent& event) {
++          [notification, ui_context](const rex::system::AchievementEvent& event) {
+             if (auto dialog = notification.lock()) {
+               dialog->Push(event);
++              // 0022: shown from the UI thread, where the dialog joins the drawers
++              ui_context->CallInUIThreadDeferred([notification]() {
++                if (auto shown = notification.lock()) {
++                  shown->ShowPendingFromUIThread();
++                }
++              });
+             }
+           });
+     }
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index 735111d007edf377e9a5cd6dc005547cd0a9a136..2c3dab2e676aa23c55234f09eaa703507c9a3462 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -1894,6 +1894,14 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+                 swapchain_effect, paint_context_.swapchain_render_pass);
+             if (swapchain_effect_pipeline.swapchain_pipeline == VK_NULL_HANDLE) {
+               guest_output_flow.effect_count = 0;
++            } else {
++              // WebOfShadowsRecomp (0016, as TheSimpsonsGame-PS5-Builder has it):
++              // without this the pipeline was taken as made for another format
++              // on every paint - the painting thread (the GPU command processor)
++              // waited for the previous paint to complete on the GPU and
++              // created the pipeline again, every frame.
++              swapchain_effect_pipeline.swapchain_format =
++                  paint_context_.swapchain_render_pass_format;
+             }
+           }
+         }

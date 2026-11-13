@@ -1,0 +1,1 @@
+"vsHash,psHash,spec,layoutKey,declRaw,strides,topology,rtFormats,rtCount,dsFormat,sampleCount,cull,frontFace,depthBias,slopeScaledDepthBias,targetScale,depthClip,depthEnable,depthWrite,depthFunc,stencilEnable,stencilReadMask,stencilWriteMask,stencilRef,stencilFront,stencilBack,blend0,blend1,blend2,blend3,alphaToCoverage,velocity,frame,session,package",

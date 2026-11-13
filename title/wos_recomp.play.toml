@@ -1,0 +1,42 @@
+# Spider-Man: Web of Shadows - PS5 native renderer (PPSA99311) - GAMEPLAY settings
+# Rename to wos_recomp.toml and put it beside eboot.bin. A new build overwrites this
+# file in dist/, so keep this copy.
+
+# --- Renderer -------------------------------------------------------------------
+# false = emulated GPU (30 fps)
+wos_native_renderer = true
+# 60 = steady 60 fps with the native renderer
+video_mode_refresh_rate = 60
+vsync = true
+# emulated-GPU pacing; must stay false (default is true)
+wos_display_pacing = false
+
+# --- Picture --------------------------------------------------------------------
+# 1 = 720p, 2 = 1440p, 3 = 4K
+draw_resolution_scale_x = 2
+draw_resolution_scale_y = 2
+present_effect = "bilinear"
+# -1 game's own, 0 off, 1..5 = 1x..16x
+anisotropic_override = 4
+
+# --- Rendering fixes (keep) -----------------------------------------------------
+# false brings back chunky lighting changes
+wos_depth_shells = true
+# Xbox 360 20e4 depth precision
+wos_depth_float24 = true
+# shader constants from the command stream
+wos_stream_type0_constants = true
+
+# --- Threading tweaks (keep) ----------------------------------------------------
+wos_fast_pulse = true
+wos_sleep0_spin_us = 2
+
+# --- Diagnostics: all off -------------------------------------------------------
+wos_diagnostics = false
+wos_profile = false
+wos_shader_harvest = false
+eot_diag_dump = false
+# L3+R3 still saves a capture if ever needed
+wos_capture_frame = 0
+dump_shaders = ""
+wos_shader_dump = false

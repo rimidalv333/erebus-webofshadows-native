@@ -1,0 +1,62 @@
+--- a/XenosRecomp/shader_recompiler.cpp	2026-11-08 17:23:36.364092900 +0000
++++ b/XenosRecomp/shader_recompiler.cpp	2026-11-08 17:23:36.376801685 +0000
+@@ -313,8 +313,44 @@
+ 
+ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicubic)
+ {
++    // WoS port (fix110): getGradients - coarse screen-space derivatives of the source's xy,
++    // as Xenia: (ddx(s.x), ddy(s.x), ddx(s.y), ddy(s.y)). It was dropped, leaving its
++    // destination 0: the park water's ripple frame multiplied by 0 = a flat mirror.
++    if (instr.opcode == FetchOpcode::GetTextureGradients)
++    {
++        if (instr.isPredicated)
++        {
++            indent();
++            println("if ({}p0)", instr.predCondition ? "" : "!");
++            indent();
++            out += "{\n";
++            ++indentation;
++        }
++        indent();
++        print("r{}.", instr.dstRegister);
++        printDstSwizzle(instr.dstSwizzle, false);
++        print(" = getGradients(r{}.", instr.srcRegister);
++        for (size_t i = 0; i < 2; i++)
++            out += SWIZZLES[((instr.srcSwizzle >> (i * 2))) & 0x3];
++        out += ").";
++        printDstSwizzle(instr.dstSwizzle, true);
++        out += ";\n";
++        printDstSwizzle01(instr.dstRegister, instr.dstSwizzle);
++        if (instr.isPredicated)
++        {
++            --indentation;
++            indent();
++            out += "}\n";
++        }
++        return;
++    }
+     if (instr.opcode != FetchOpcode::TextureFetch && instr.opcode != FetchOpcode::GetTextureWeights)
++    {
++        // fix110: make other dropped fetch kinds visible in the HLSL
++        indent();
++        println("// WoS: unsupported fetch opcode {} -> r{} left as is", uint32_t(instr.opcode), instr.dstRegister);
+         return;
++    }
+ 
+     if (instr.isPredicated)
+     {
+--- a/XenosRecomp/shader_common.h	2026-11-08 17:23:36.365343648 +0000
++++ b/XenosRecomp/shader_common.h	2026-11-08 17:23:36.377160609 +0000
+@@ -183,6 +183,12 @@
+     return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture));
+ }
+ 
++// WoS port (fix110): Xenos getGradients - (ddx(c.x), ddy(c.x), ddx(c.y), ddy(c.y)), coarse
++float4 getGradients(float2 c)
++{
++    return float4(ddx_coarse(c.x), ddy_coarse(c.x), ddx_coarse(c.y), ddy_coarse(c.y));
++}
++
+ float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
+ {
+     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];

@@ -1,0 +1,62 @@
+--- a/XenosRecomp/shader_common.h	2026-11-01 18:06:43.993762107 +0000
++++ b/XenosRecomp/shader_common.h	2026-11-01 18:06:43.995996509 +0000
+@@ -266,6 +266,33 @@
+     return g_Texture3DDescriptorHeap[resourceDescriptorIndex].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord);
+ }
+ 
++// WoS port: fetches whose instruction has tx_coord_denorm set take coordinates in texels
++// (the EDRAM restore/copy passes compute them from the pixel position): normalised here.
++float4 tfetch1DUnnorm(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float texCoord)
++{
++    uint width;
++    g_Texture1DDescriptorHeap[resourceDescriptorIndex].GetDimensions(width);
++    return tfetch1D(resourceDescriptorIndex, samplerDescriptorIndex, texCoord / float(max(width, 1u)));
++}
++
++float4 tfetch2DUnnorm(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
++{
++    float2 dimensions = float2(max(getTexture2DDimensions(g_Texture2DDescriptorHeap[resourceDescriptorIndex]), uint2(1, 1)));
++    return tfetch2D(resourceDescriptorIndex, samplerDescriptorIndex, texCoord / dimensions, offset);
++}
++
++float4 tfetch3DUnnorm(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord)
++{
++    uint3 dimensions;
++    g_Texture3DDescriptorHeap[resourceDescriptorIndex].GetDimensions(dimensions.x, dimensions.y, dimensions.z);
++    return tfetch3D(resourceDescriptorIndex, samplerDescriptorIndex, texCoord / float3(max(dimensions, uint3(1, 1, 1))));
++}
++
++float2 getWeights2DUnnorm(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
++{
++    return select(isnan(texCoord), 0.0, frac(texCoord + offset - 0.5));
++}
++
+ struct CubeMapData
+ {
+     float3 cubeMapDirections[2];
+--- a/XenosRecomp/shader_recompiler.cpp	2026-11-01 18:06:43.991681794 +0000
++++ b/XenosRecomp/shader_recompiler.cpp	2026-11-01 18:06:43.995937607 +0000
+@@ -309,6 +309,8 @@
+     }
+ }
+ 
++size_t g_unnormFetches = 0;  // WoS port: counted for the tool's report
++
+ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicubic)
+ {
+     if (instr.opcode != FetchOpcode::TextureFetch && instr.opcode != FetchOpcode::GetTextureWeights)
+@@ -416,6 +418,14 @@
+ 
+     out += dimension;
+ 
++    // WoS port: texel-space coordinates (tx_coord_denorm) - see tfetch2DUnnorm
++    if (instr.texCoordDenorm && instr.dimension != TextureDimension::TextureCube &&
++        (instr.opcode == FetchOpcode::TextureFetch || instr.dimension == TextureDimension::Texture2D))
++    {
++        out += "Unnorm";
++        ++g_unnormFetches;
++    }
++
+ #ifdef UNLEASHED_RECOMP
+     if (bicubic)
+         out += "Bicubic";

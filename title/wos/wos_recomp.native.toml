@@ -1,0 +1,68 @@
+# Spider-Man: Web of Shadows - PS5 native renderer (PPSA99311) - release settings
+# Lives beside eboot.bin. Edit with care: these are the tested, ready-to-play values.
+
+# --- Renderer -------------------------------------------------------------------
+# false = emulated GPU (30 fps)
+wos_native_renderer = true
+# 60 = steady 60 fps with the native renderer
+video_mode_refresh_rate = 60
+vsync = true
+# emulated-GPU pacing; must stay false with the native renderer
+wos_display_pacing = false
+
+# --- Smoother frame drops -------------------------------------------------------
+# A frame that misses its refresh is shown at once (a brief tear line) instead of
+# a whole refresh later: a drop to 45-55 fps stays even instead of juddering.
+# No tearing while the game holds 60. false = plain vsync.
+wos_adaptive_sync = false
+# Present a frame only once the previous one is on screen: steadier motion and
+# less input delay. false = the renderer may run two frames ahead of the display.
+wos_even_pacing = false
+
+# --- City draw culling -----------------------------------------------------------
+# Window strips of buildings that are completely hidden behind nearer buildings are
+# not drawn (nothing visible changes). 0 = off, 1 = on, 2 = on, and the game's own
+# draw call is skipped as well (faster).
+wos_facade_occlusion = 0
+# Cheaper drawing of the city's window strips (quad lists). 0 = off, 1 = one shared
+# index pattern, 2 = also reuse the previous strip's state when nothing changed.
+# (3 = as 1, with the reuse checked and counted in the log.)
+wos_strip_fast_path = 2
+# Each of the game's window-strip lists drawn as one draw instead of one per strip
+# (0 off, 1 on, 2 off but log the lists' statistics)
+wos_strip_merge = 1
+
+# --- Picture --------------------------------------------------------------------
+# 1 = 720p, 2 = 1440p, 3 = 4K
+draw_resolution_scale_x = 2
+draw_resolution_scale_y = 2
+present_effect = "bilinear"
+# Filter that scales the picture to the screen: bilinear, bicubic or lanczos (sharpest)
+wos_upscale = "lanczos"
+# Anti-aliasing (multisampling): 0 = off, 2, 4 or 8 samples
+wos_msaa = 4
+# Anisotropic texture filtering: 0 = as the game asks, 1 = off, 2-16
+wos_anisotropy = 16
+
+# --- Rendering fixes (keep) -----------------------------------------------------
+# false brings back chunky lighting changes
+wos_depth_shells = true
+# Xbox 360 20e4 depth precision
+wos_depth_float24 = true
+# shader constants from the command stream
+wos_stream_type0_constants = true
+
+# --- Threading (keep) -----------------------------------------------------------
+wos_fast_pulse = true
+wos_sleep0_spin_us = 0
+
+# --- Diagnostics (all off) ------------------------------------------------------
+wos_diagnostics = false
+wos_profile = false
+wos_shader_harvest = false
+eot_diag_dump = false
+# L3+R3 frame capture off (it freezes the game for several seconds)
+wos_capture_pad = false
+wos_capture_frame = 0
+dump_shaders = ""
+wos_shader_dump = false

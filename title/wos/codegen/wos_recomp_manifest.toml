@@ -1,0 +1,215 @@
+# WebOfShadowsRecomp for the PS5 - the recompiler's manifest.
+#
+# wos/tools/codegen.sh copies this into the WebOfShadowsRecomp checkout (whose
+# own repository does not publish one) and runs `rexglue codegen` on it there.
+# Paths are relative to that checkout: the game's files in game/, as the PC
+# release lays them out, the code into generated/default.
+#
+# The project's name, wos_recomp, is the one WebOfShadowsRecomp's sources expect
+# (generated/default/wos_recomp_init.h, PPCImageConfig).
+#
+# SPDX-License-Identifier: MIT
+
+[project]
+name = "wos_recomp"
+game_root = "game"
+
+[entrypoint]
+file_path = "game/default.xex"
+out_directory_path = "generated/default"
+includes = []
+
+# Entry points the analysis does not find by itself: code reached only by a tail
+# branch (`b`) from another function, reported as "target not in any function".
+# Declared here so the branches into them are calls, not REX_FATAL.
+[entrypoint.functions]
+0x82A05A28 = {}   # b from 0x82A03BEC
+0x82A564B0 = {}   # b from 0x82A4B99C
+# One function from 0x82A5AA20 to 0x82A5AA74 (a list lookup); the analysis started
+# it at 0x82A5AA50, its middle, and left the branches back to 0x82A5AA48 unresolved
+0x82A5AA20 = { end = 0x82A5AA74 }
+# C++ catch funclets that end in _CxxThrowException (0x82B2B710, a rethrow that
+# does not return): the analysis ran on past it into the next funclet and its
+# branches into a label of another function did not compile
+0x8299A844 = { end = 0x8299A8C0 }
+0x829A7570 = { end = 0x829A75EC }
+0x829AD178 = { end = 0x829AD1F4 }
+0x829B3C80 = { end = 0x829B3CFC }
+0x829B79AC = { end = 0x829B7A28 }
+
+# Code the analysis does not reach, found running the game on the console:
+# WebOfShadowsRecomp's fallback interpreter ran it instead, which is slower
+# and logs it ("[WoS-Interp] Discovered unregistered guest function").
+0x829FE470 = { end = 0x829FE488 }
+0x82A4B708 = { end = 0x82A4B70C }
+0x82A8D8E8 = {}
+
+# Pointer-to-member call thunks (lwz r12,0(rN); lwz r11,off(r12); mtctr r11; bctr),
+# 16 bytes each, called only through tables: every one in default.xex that the
+# analysis has no function for
+0x82431E80 = { end = 0x82431E90 }
+0x82431E90 = { end = 0x82431EA0 }
+0x82431EA0 = { end = 0x82431EB0 }
+0x82431EB0 = { end = 0x82431EC0 }
+0x82431EC0 = { end = 0x82431ED0 }
+0x82431ED0 = { end = 0x82431EE0 }
+0x82431EE0 = { end = 0x82431EF0 }
+0x82431EF0 = { end = 0x82431F00 }
+0x82431F00 = { end = 0x82431F10 }
+0x82431F10 = { end = 0x82431F20 }
+0x82431F20 = { end = 0x82431F30 }
+0x82431F30 = { end = 0x82431F40 }
+0x82431F40 = { end = 0x82431F50 }
+0x82431F50 = { end = 0x82431F60 }
+0x82431F60 = { end = 0x82431F70 }
+0x82431F70 = { end = 0x82431F80 }
+0x82431F80 = { end = 0x82431F90 }
+0x82431F90 = { end = 0x82431FA0 }
+0x82431FA0 = { end = 0x82431FB0 }
+0x82431FB0 = { end = 0x82431FC0 }
+0x82431FC0 = { end = 0x82431FD0 }
+0x82431FD0 = { end = 0x82431FE0 }
+0x82431FE0 = { end = 0x82431FF0 }
+0x82431FF0 = { end = 0x82432000 }
+0x82432000 = { end = 0x82432010 }
+0x82432010 = { end = 0x82432020 }
+0x82432020 = { end = 0x82432030 }
+0x82432030 = { end = 0x82432040 }
+0x82432040 = { end = 0x82432050 }
+0x82432050 = { end = 0x82432060 }
+0x82432060 = { end = 0x82432070 }
+0x82432070 = { end = 0x82432080 }
+0x82432080 = { end = 0x82432090 }
+0x82432090 = { end = 0x824320A0 }
+0x824320A0 = { end = 0x824320B0 }
+0x824320B0 = { end = 0x824320C0 }
+0x824320C0 = { end = 0x824320D0 }
+0x824320D0 = { end = 0x824320E0 }
+0x824320E0 = { end = 0x824320F0 }
+0x824320F0 = { end = 0x82432100 }
+0x82432100 = { end = 0x82432110 }
+0x82432110 = { end = 0x82432120 }
+0x82432120 = { end = 0x82432130 }
+0x82432130 = { end = 0x82432140 }
+0x82432140 = { end = 0x82432150 }
+0x82432150 = { end = 0x82432160 }
+0x82432160 = { end = 0x82432170 }
+0x82432170 = { end = 0x82432180 }
+0x82432180 = { end = 0x82432190 }
+0x82432190 = { end = 0x824321A0 }
+0x824321A0 = { end = 0x824321B0 }
+0x824321B0 = { end = 0x824321C0 }
+0x824321C0 = { end = 0x824321D0 }
+0x824321D0 = { end = 0x824321E0 }
+0x824321E0 = { end = 0x824321F0 }
+0x824321F0 = { end = 0x82432200 }
+0x82432200 = { end = 0x82432210 }
+0x82432210 = { end = 0x82432220 }
+0x82432220 = { end = 0x82432230 }
+0x82432230 = { end = 0x82432240 }
+0x82432240 = { end = 0x82432250 }
+0x82432250 = { end = 0x82432260 }
+0x82432260 = { end = 0x82432270 }
+0x82432270 = { end = 0x82432280 }
+0x82432280 = { end = 0x82432290 }
+0x82432290 = { end = 0x824322A0 }
+0x824322A0 = { end = 0x824322B0 }
+0x824322B0 = { end = 0x824322C0 }
+0x824322C0 = { end = 0x824322D0 }
+0x824322D0 = { end = 0x824322E0 }
+0x824322E0 = { end = 0x824322F0 }
+0x824322F0 = { end = 0x82432300 }
+0x82432300 = { end = 0x82432310 }
+0x82432310 = { end = 0x82432320 }
+0x82432320 = { end = 0x82432330 }
+0x82432330 = { end = 0x82432340 }
+0x82432340 = { end = 0x82432350 }
+0x82432350 = { end = 0x82432360 }
+0x82432360 = { end = 0x82432370 }
+0x82432370 = { end = 0x82432380 }
+0x82432380 = { end = 0x82432390 }
+0x82432390 = { end = 0x824323A0 }
+0x824323A0 = { end = 0x824323B0 }
+0x824323B0 = { end = 0x824323C0 }
+0x824323C0 = { end = 0x824323D0 }
+0x824323D0 = { end = 0x824323E0 }
+0x824323E0 = { end = 0x824323F0 }
+0x824323F0 = { end = 0x82432400 }
+0x82432400 = { end = 0x82432410 }
+0x82432410 = { end = 0x82432420 }
+0x82432420 = { end = 0x82432430 }
+0x82432430 = { end = 0x82432440 }
+0x82432440 = { end = 0x82432450 }
+0x82432450 = { end = 0x82432460 }
+0x82432460 = { end = 0x82432470 }
+0x82432470 = { end = 0x82432480 }
+0x82432480 = { end = 0x82432490 }
+0x82432490 = { end = 0x824324A0 }
+0x824324A0 = { end = 0x824324B0 }
+0x824324B0 = { end = 0x824324C0 }
+0x824324C0 = { end = 0x824324D0 }
+0x824324D0 = { end = 0x824324E0 }
+0x824324E0 = { end = 0x824324F0 }
+0x824324F0 = { end = 0x82432500 }
+0x82432500 = { end = 0x82432510 }
+0x82432510 = { end = 0x82432520 }
+0x82432520 = { end = 0x82432530 }
+0x82432530 = { end = 0x82432540 }
+0x82432540 = { end = 0x82432550 }
+0x82432550 = { end = 0x82432560 }
+0x82432560 = { end = 0x82432570 }
+0x82432570 = { end = 0x82432580 }
+0x82432580 = { end = 0x82432590 }
+0x82432590 = { end = 0x824325A0 }
+0x824325A0 = { end = 0x824325B0 }
+0x824325B0 = { end = 0x824325C0 }
+0x824325C0 = { end = 0x824325D0 }
+0x824325D0 = { end = 0x824325E0 }
+0x824325E0 = { end = 0x824325F0 }
+0x824325F0 = { end = 0x82432600 }
+0x82432600 = { end = 0x82432610 }
+0x82432610 = { end = 0x82432620 }
+0x82432620 = { end = 0x82432630 }
+0x82432630 = { end = 0x82432640 }
+0x82432640 = { end = 0x82432650 }
+0x82432650 = { end = 0x82432660 }
+0x82432660 = { end = 0x82432670 }
+0x82432670 = { end = 0x82432680 }
+0x82432680 = { end = 0x82432690 }
+0x82432690 = { end = 0x824326A0 }
+0x824326A0 = { end = 0x824326B0 }
+0x824326B0 = { end = 0x824326C0 }
+0x824326C0 = { end = 0x824326D0 }
+0x824326D0 = { end = 0x824326E0 }
+0x824326E0 = { end = 0x824326F0 }
+0x824326F0 = { end = 0x82432700 }
+0x82432700 = { end = 0x82432710 }
+0x82432710 = { end = 0x82432720 }
+0x82432720 = { end = 0x82432730 }
+0x82432730 = { end = 0x82432740 }
+0x82432740 = { end = 0x82432750 }
+0x82432750 = { end = 0x82432760 }
+0x82432760 = { end = 0x82432770 }
+0x82432770 = { end = 0x82432780 }
+0x82432780 = { end = 0x82432790 }
+0x82432790 = { end = 0x824327A0 }
+0x824327A0 = { end = 0x824327B0 }
+0x824327B0 = { end = 0x824327C0 }
+0x824327C0 = { end = 0x824327D0 }
+0x824327D0 = { end = 0x824327E0 }
+0x824327E0 = { end = 0x824327F0 }
+0x824327F0 = { end = 0x82432800 }
+0x82432800 = { end = 0x82432810 }
+0x82432810 = { end = 0x82432820 }
+0x82432820 = { end = 0x82432830 }
+0x82432830 = { end = 0x82432840 }
+0x82432840 = { end = 0x82432850 }
+0x82432850 = { end = 0x82432860 }
+0x82432860 = { end = 0x82432870 }
+0x82432870 = { end = 0x82432880 }
+0x82432880 = { end = 0x82432890 }
+0x82432890 = { end = 0x824328A0 }
+0x824328A0 = { end = 0x824328B0 }
+0x824328B0 = { end = 0x824328C0 }
+0x829DBC38 = { end = 0x829DBC48 }
+0x829DBC48 = { end = 0x829DBC58 }

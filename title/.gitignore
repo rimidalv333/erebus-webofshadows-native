@@ -1,0 +1,8 @@
+build/
+dist/
+klog/
+.deps/
+imgui.ini
+__pycache__/
+# The home-screen art: the game's own, kept on the machine that builds (wos/title-art.py)
+wos/title-art/
